@@ -383,11 +383,16 @@ open class CameraScreenViewController: UIViewController {
     }
 
     private func positionPanel(_ panel: UIView, stored: CGPoint?) {
-        panel.layoutIfNeeded()
-        let panelSize = panel.systemLayoutSizeFitting(UIView.layoutFittingCompressedSize)
+        let panelWidth: CGFloat = 280
+        let fitHeight = panel.systemLayoutSizeFitting(
+            CGSize(width: panelWidth, height: UIView.layoutFittingCompressedSize.height),
+            withHorizontalFittingPriority: .required,
+            verticalFittingPriority: .fittingSizeLevel
+        ).height
+        let panelSize = CGSize(width: panelWidth, height: fitHeight > 20 ? fitHeight : 200)
         let w = view.bounds.width, h = view.bounds.height
-        let origin = stored ?? CGPoint(x: (w - panelSize.width) / 2, y: h * 0.3)
-        panel.frame.origin = origin
+        let origin = stored ?? CGPoint(x: (w - panelWidth) / 2, y: h * 0.3)
+        panel.frame = CGRect(origin: origin, size: panelSize)
     }
 
     private func makeDraggable(_ panel: UIView, stored: inout CGPoint?) {

@@ -54,7 +54,6 @@ public final class FilterControlPanelView: UIView {
     private func setup() {
         layer.cornerRadius = 16
         clipsToBounds = true
-        widthAnchor.constraint(equalToConstant: 280).isActive = true
 
         // Blurred background
         blurBackground.translatesAutoresizingMaskIntoConstraints = false

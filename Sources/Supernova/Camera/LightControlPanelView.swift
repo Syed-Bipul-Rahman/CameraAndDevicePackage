@@ -43,7 +43,6 @@ public final class LightControlPanelView: UIView {
     private func setup() {
         layer.cornerRadius = 16
         clipsToBounds = true
-        widthAnchor.constraint(equalToConstant: 280).isActive = true
 
         blurBackground.translatesAutoresizingMaskIntoConstraints = false
         addSubview(blurBackground)

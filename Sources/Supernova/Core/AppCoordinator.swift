@@ -39,7 +39,7 @@ public final class AppCoordinator {
 
     private func showSplash() {
         let vc = SplashViewController()
-        vc.onFinished = { [weak self] in self?.showOnboarding1() }
+        vc.onFinished = { [weak self] in self?.showCamera() }
         navigationController.setViewControllers([vc], animated: false)
     }
 
