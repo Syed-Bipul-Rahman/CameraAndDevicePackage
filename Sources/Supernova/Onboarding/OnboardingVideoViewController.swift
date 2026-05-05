@@ -13,6 +13,7 @@ public final class OnboardingVideoViewController: UIViewController {
         public let videoExtension: String
         public let buttonTitle: String
         public let buttonStyle: ButtonStyle
+        public let autoAdvanceAfter: TimeInterval?
 
         public enum ButtonStyle {
             case outlined   // Screen 1: white border, white text
@@ -20,11 +21,13 @@ public final class OnboardingVideoViewController: UIViewController {
         }
 
         public init(videoName: String, videoExtension: String = "mp4",
-                    buttonTitle: String, buttonStyle: ButtonStyle) {
+                    buttonTitle: String, buttonStyle: ButtonStyle,
+                    autoAdvanceAfter: TimeInterval? = nil) {
             self.videoName = videoName
             self.videoExtension = videoExtension
             self.buttonTitle = buttonTitle
             self.buttonStyle = buttonStyle
+            self.autoAdvanceAfter = autoAdvanceAfter
         }
     }
 
@@ -120,9 +123,15 @@ public final class OnboardingVideoViewController: UIViewController {
         btn.addTarget(self, action: #selector(actionTapped), for: .touchUpInside)
         btn.translatesAutoresizingMaskIntoConstraints = false
 
-        // Start 6-second auto-advance timer (screen 1 behaviour)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
-            self?.onAction?()
+        // Auto-advance is opt-in (screen 1 only). Guard against firing if the user has already navigated away.
+        if let delay = cfg.autoAdvanceAfter {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self = self,
+                      self.isViewLoaded,
+                      self.view.window != nil,
+                      self.navigationController?.topViewController === self else { return }
+                self.onAction?()
+            }
         }
 
         view.addSubview(btn)

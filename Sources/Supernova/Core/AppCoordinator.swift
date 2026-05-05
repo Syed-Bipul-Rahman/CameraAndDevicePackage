@@ -29,7 +29,8 @@ public final class AppCoordinator {
         window.makeKeyAndVisible()
 
         if UserDefaults.standard.bool(forKey: Self.onboardingDoneKey) {
-            showHome()
+            // Returning user: skip the video onboarding but still require a fresh BLE connection.
+            showFindDevice()
         } else {
             showSplash()
         }
@@ -45,7 +46,7 @@ public final class AppCoordinator {
 
     private func showOnboarding1() {
         let vc = OnboardingVideoViewController()
-        vc.config = .init(videoName: "light1", buttonTitle: "Let's Get Started", buttonStyle: .outlined)
+        vc.config = .init(videoName: "light1", buttonTitle: "Let's Get Started", buttonStyle: .outlined, autoAdvanceAfter: 6)
         vc.onAction = { [weak self] in self?.showOnboarding2() }
         navigationController.setViewControllers([vc], animated: true)
     }
@@ -70,7 +71,14 @@ public final class AppCoordinator {
         let vc = ConnectingViewController()
         vc.bleService = bleService
         vc.device = device
-        vc.onConnected = { [weak self] in self?.showOnboarding4() }
+        vc.onConnected = { [weak self] in
+            // First-time users go through onboarding 4; returning users go straight home.
+            if UserDefaults.standard.bool(forKey: Self.onboardingDoneKey) {
+                self?.showHome()
+            } else {
+                self?.showOnboarding4()
+            }
+        }
         vc.onRetry = { [weak self] in
             self?.navigationController.popViewController(animated: true)
         }
