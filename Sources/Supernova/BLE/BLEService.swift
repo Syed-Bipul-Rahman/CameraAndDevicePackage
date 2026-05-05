@@ -38,7 +38,6 @@ public final class BLEService: NSObject {
 
     public weak var delegate: BLEServiceDelegate?
 
-    // Published state for SwiftUI / Combine consumers
     @Published public private(set) var connectionState: BLEConnectionState = .idle
     @Published public private(set) var discoveredDevices: [DiscoveredDevice] = []
     @Published public private(set) var isBluetoothReady: Bool = false
@@ -47,28 +46,36 @@ public final class BLEService: NSObject {
     private var connectedPeripheral: CBPeripheral?
     private var writeCharacteristic: CBCharacteristic?
     private var notifyCharacteristic: CBCharacteristic?
+    private var pendingStartScan = false
 
     private var heartbeatTimer: Timer?
     private var scanTimer: Timer?
 
-    // ENSY device name prefix used for filtering during scan
-    private let deviceNamePrefix = "ENSY"
-
     public override init() {
         super.init()
-        centralManager = CBCentralManager(delegate: self, queue: DispatchQueue(label: "com.supernova.ble", qos: .userInitiated))
+        // Use main queue so delegate callbacks land on main and Timers fire on the main RunLoop.
+        centralManager = CBCentralManager(delegate: self, queue: nil)
     }
 
     // MARK: - Scanning
 
     public func startScan(timeout: TimeInterval = 15) {
         guard centralManager.state == .poweredOn else {
-            updateState(.error("Bluetooth is not available"))
+            // If BT not yet ready, queue the scan to start once it powers on.
+            pendingStartScan = true
+            if centralManager.state == .poweredOff || centralManager.state == .unauthorized || centralManager.state == .unsupported {
+                updateState(.error("Bluetooth is not available"))
+            }
             return
         }
+        pendingStartScan = false
         discoveredDevices.removeAll()
         updateState(.scanning)
-        centralManager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+        // Allow duplicates so iOS keeps delivering peripherals (including scan responses that carry the name).
+        centralManager.scanForPeripherals(
+            withServices: nil,
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+        )
 
         scanTimer?.invalidate()
         scanTimer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
@@ -90,6 +97,7 @@ public final class BLEService: NSObject {
     public func connect(to device: DiscoveredDevice) {
         stopScan()
         connectedPeripheral = device.peripheral
+        device.peripheral.delegate = self
         updateState(.connecting(peripheral: device.name))
         centralManager.connect(device.peripheral, options: nil)
     }
@@ -134,7 +142,9 @@ public final class BLEService: NSObject {
         guard let peripheral = connectedPeripheral,
               let characteristic = writeCharacteristic,
               peripheral.state == .connected else { return }
-        peripheral.writeValue(data, for: characteristic, type: .withoutResponse)
+        let writeType: CBCharacteristicWriteType =
+            characteristic.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
+        peripheral.writeValue(data, for: characteristic, type: writeType)
     }
 
     private func updateState(_ state: BLEConnectionState) {
@@ -151,6 +161,7 @@ extension BLEService: CBCentralManagerDelegate {
         switch central.state {
         case .poweredOn:
             isBluetoothReady = true
+            if pendingStartScan { startScan() }
         case .poweredOff, .unauthorized, .unsupported:
             isBluetoothReady = false
             stopHeartbeat()
@@ -163,11 +174,20 @@ extension BLEService: CBCentralManagerDelegate {
 
     public func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                                advertisementData: [String: Any], rssi RSSI: NSNumber) {
-        guard let name = peripheral.name, name.hasPrefix(deviceNamePrefix) else { return }
+        // Prefer the name from the advertisement (delivered in scan response on iOS) over the cached peripheral name.
+        let advName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
+        let name = advName ?? peripheral.name ?? ""
+        // Skip devices that don't advertise any name — keeps the list clean while still showing all named peripherals.
+        guard !name.isEmpty else { return }
 
         let device = DiscoveredDevice(id: peripheral.identifier, name: name, rssi: RSSI.intValue, peripheral: peripheral)
 
-        if !discoveredDevices.contains(where: { $0.id == device.id }) {
+        if let idx = discoveredDevices.firstIndex(where: { $0.id == device.id }) {
+            // Update RSSI / name as scan responses come in.
+            if discoveredDevices[idx].rssi != device.rssi || discoveredDevices[idx].name != device.name {
+                discoveredDevices[idx] = device
+            }
+        } else {
             discoveredDevices.append(device)
             delegate?.bleService(self, didDiscoverDevice: device)
         }
@@ -198,7 +218,10 @@ extension BLEService: CBCentralManagerDelegate {
 extension BLEService: CBPeripheralDelegate {
 
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        guard error == nil, let services = peripheral.services else { return }
+        guard error == nil, let services = peripheral.services else {
+            updateState(.error(error?.localizedDescription ?? "Service discovery failed"))
+            return
+        }
         for service in services {
             peripheral.discoverCharacteristics(nil, for: service)
         }
@@ -207,32 +230,53 @@ extension BLEService: CBPeripheralDelegate {
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         guard error == nil, let characteristics = service.characteristics else { return }
 
+        // CBUUID returns the short form for 16-bit UUIDs (e.g. "FFE9"), so match by substring.
+        let svcUuid = service.uuid.uuidString.uppercased()
+        let isGenericService = svcUuid == "1800" || svcUuid == "1801" || svcUuid == "180A"
+
         for characteristic in characteristics {
-            let uuid = characteristic.uuid.uuidString.lowercased()
-            if uuid == DeviceProtocol.writeCharUUID {
-                writeCharacteristic = characteristic
+            let charUuid = characteristic.uuid.uuidString.uppercased()
+            let props = characteristic.properties
+
+            // WRITE: prefer FFE9; otherwise any writable char in a non-generic service.
+            if props.contains(.writeWithoutResponse) || props.contains(.write) {
+                if charUuid.contains("FFE9") {
+                    writeCharacteristic = characteristic
+                } else if writeCharacteristic == nil && !isGenericService {
+                    writeCharacteristic = characteristic
+                }
             }
-            if uuid == DeviceProtocol.notifyCharUUID {
-                notifyCharacteristic = characteristic
-                peripheral.setNotifyValue(true, for: characteristic)
+
+            // NOTIFY: prefer FFE4; otherwise the first notify/indicate char in a non-generic service.
+            if props.contains(.notify) || props.contains(.indicate) {
+                if charUuid.contains("FFE4") {
+                    notifyCharacteristic = characteristic
+                    peripheral.setNotifyValue(true, for: characteristic)
+                } else if notifyCharacteristic == nil && !isGenericService {
+                    notifyCharacteristic = characteristic
+                    peripheral.setNotifyValue(true, for: characteristic)
+                }
             }
         }
 
-        // Ready when write characteristic is found
-        if writeCharacteristic != nil {
+        // Move to .connected only after the last service finishes discovery and we have a write characteristic.
+        let allDiscovered = peripheral.services?.allSatisfy { $0.characteristics != nil } ?? false
+        if allDiscovered, writeCharacteristic != nil {
             let name = peripheral.name ?? peripheral.identifier.uuidString
             updateState(.connected(peripheral: name))
             startHeartbeat()
+        } else if allDiscovered, writeCharacteristic == nil {
+            updateState(.error("No writable characteristic found on this device"))
+            centralManager.cancelPeripheralConnection(peripheral)
         }
     }
 
     public func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard error == nil, let data = characteristic.value else { return }
-        // Response parsing available for future use
         _ = DeviceProtocol.parseResponse(data)
     }
 
     public func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
-        // Write-without-response doesn't trigger this; write-with-response would
+        // No-op: we use writeWithoutResponse when available.
     }
 }
