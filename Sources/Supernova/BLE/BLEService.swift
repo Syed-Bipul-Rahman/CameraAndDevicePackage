@@ -177,8 +177,8 @@ extension BLEService: CBCentralManagerDelegate {
         // Prefer the name from the advertisement (delivered in scan response on iOS) over the cached peripheral name.
         let advName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
         let name = advName ?? peripheral.name ?? ""
-        // Skip devices that don't advertise any name — keeps the list clean while still showing all named peripherals.
-        guard !name.isEmpty else { return }
+        // Only show ENSY devices in the app.
+        guard name.hasPrefix("ENSY") else { return }
 
         let device = DiscoveredDevice(id: peripheral.identifier, name: name, rssi: RSSI.intValue, peripheral: peripheral)
 
