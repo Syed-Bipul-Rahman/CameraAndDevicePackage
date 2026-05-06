@@ -198,9 +198,10 @@ class BeautyFilterProcessor {
 
     private func applyLipPlump(to image: CIImage) -> CIImage {
         guard !detectedFaces.isEmpty else { return image }
-        var outputImage = image
+        var warped = image
         let imageExtent = image.extent
 
+        // 1) Apply bump distortion at jaw points with a much tighter radius so the warp stays inside the face.
         for face in detectedFaces {
             let faceRect = CGRect(
                 x: face.boundingBox.origin.x * imageExtent.width + imageExtent.origin.x,
@@ -209,28 +210,70 @@ class BeautyFilterProcessor {
                 height: face.boundingBox.height * imageExtent.height
             )
 
-            let jawY = faceRect.origin.y + faceRect.height * 0.22
-            let leftJawX  = faceRect.origin.x + faceRect.width * 0.18
-            let rightJawX = faceRect.origin.x + faceRect.width * 0.82
-            let radius = faceRect.width * 0.38
+            // Slightly above the chin, pulled inward from the silhouette edge.
+            let jawY = faceRect.origin.y + faceRect.height * 0.18
+            let leftJawX  = faceRect.origin.x + faceRect.width * 0.26
+            let rightJawX = faceRect.origin.x + faceRect.width * 0.74
+
+            // Radius capped at ~22% of face width — well inside the face cheek region.
+            let radius = faceRect.width * 0.22
             let intensity = Double(lipPlumpIntensity)
-            let scale = intensity > 0 ? -intensity * 0.18 : -intensity * 0.22
+            // Symmetric, gentler distortion so realism holds at full slider extent.
+            let scale = intensity > 0 ? -intensity * 0.10 : -intensity * 0.14
 
-            guard let leftBump = CIFilter(name: "CIBumpDistortion") else { continue }
-            leftBump.setValue(outputImage, forKey: kCIInputImageKey)
-            leftBump.setValue(CIVector(x: leftJawX, y: jawY), forKey: kCIInputCenterKey)
-            leftBump.setValue(radius, forKey: kCIInputRadiusKey)
-            leftBump.setValue(scale, forKey: kCIInputScaleKey)
-            if let result = leftBump.outputImage?.cropped(to: imageExtent) { outputImage = result }
-
-            guard let rightBump = CIFilter(name: "CIBumpDistortion") else { continue }
-            rightBump.setValue(outputImage, forKey: kCIInputImageKey)
-            rightBump.setValue(CIVector(x: rightJawX, y: jawY), forKey: kCIInputCenterKey)
-            rightBump.setValue(radius, forKey: kCIInputRadiusKey)
-            rightBump.setValue(scale, forKey: kCIInputScaleKey)
-            if let result = rightBump.outputImage?.cropped(to: imageExtent) { outputImage = result }
+            for centerX in [leftJawX, rightJawX] {
+                guard let bump = CIFilter(name: "CIBumpDistortion") else { continue }
+                bump.setValue(warped, forKey: kCIInputImageKey)
+                bump.setValue(CIVector(x: centerX, y: jawY), forKey: kCIInputCenterKey)
+                bump.setValue(radius, forKey: kCIInputRadiusKey)
+                bump.setValue(scale, forKey: kCIInputScaleKey)
+                if let result = bump.outputImage?.cropped(to: imageExtent) { warped = result }
+            }
         }
-        return outputImage
+
+        // 2) Mask the warp to the lower face only — anything outside the mask uses the untouched original,
+        //    so background and shoulders never bend even if a stray bump radius reached them.
+        let mask = createPlumpMask(for: detectedFaces, imageExtent: imageExtent)
+        guard let blend = CIFilter(name: "CIBlendWithMask") else { return warped }
+        blend.setValue(warped, forKey: kCIInputImageKey)
+        blend.setValue(image, forKey: kCIInputBackgroundImageKey)
+        blend.setValue(mask, forKey: kCIInputMaskImageKey)
+        return blend.outputImage?.cropped(to: imageExtent) ?? warped
+    }
+
+    /// Soft elliptical mask covering the lower 60% of each face — the jaw + lower cheeks zone.
+    /// Inset from the bounding box by ~10% so the mask stays strictly inside the face silhouette,
+    /// with a soft falloff so the transition between warped and original is invisible.
+    private func createPlumpMask(for faces: [DetectedFace], imageExtent: CGRect) -> CIImage {
+        var combined: CIImage?
+        for face in faces {
+            let faceRect = CGRect(
+                x: face.boundingBox.origin.x * imageExtent.width + imageExtent.origin.x,
+                y: (1 - face.boundingBox.origin.y - face.boundingBox.height) * imageExtent.height + imageExtent.origin.y,
+                width: face.boundingBox.width * imageExtent.width,
+                height: face.boundingBox.height * imageExtent.height
+            )
+
+            let insetX = faceRect.width * 0.10
+            let lowerHeight = faceRect.height * 0.60
+            // CIImage uses Y-up: faceRect.origin.y is the face bottom, so anchor the mask there.
+            let maskRect = CGRect(
+                x: faceRect.origin.x + insetX,
+                y: faceRect.origin.y,
+                width: faceRect.width - insetX * 2,
+                height: lowerHeight
+            )
+            let mask = createEllipticalMask(for: maskRect, imageExtent: imageExtent, softEdge: true)
+            if let existing = combined {
+                guard let add = CIFilter(name: "CIMaximumCompositing") else { continue }
+                add.setValue(existing, forKey: kCIInputImageKey)
+                add.setValue(mask, forKey: kCIInputBackgroundImageKey)
+                combined = add.outputImage
+            } else {
+                combined = mask
+            }
+        }
+        return combined?.cropped(to: imageExtent) ?? CIImage(color: CIColor.black).cropped(to: imageExtent)
     }
 
     private func applyBackgroundBlur(to image: CIImage) -> CIImage {
