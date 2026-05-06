@@ -164,7 +164,63 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
     }
 
     public func capturePhoto(completion: @escaping (Result<String, Error>) -> Void) {
+        // Capture the preview's current aspect ratio on the main thread; the photo will be cropped
+        // to this so the saved image matches what the user sees in live preview.
+        if Thread.isMainThread {
+            pendingPreviewAspect = previewAspectRatio()
+        } else {
+            DispatchQueue.main.sync { self.pendingPreviewAspect = self.previewAspectRatio() }
+        }
         capturePhotoInternal(completion: completion)
+    }
+
+    private var pendingPreviewAspect: CGFloat = 0
+
+    private func previewAspectRatio() -> CGFloat {
+        // The MTKView's frame is the *visible* preview rect — it shrinks to a centered square for 1:1
+        // and to a 16:9 strip when the user picks those ratios. Read from there, not the outer view
+        // bounds, otherwise the saved photo/video gets cropped to the full screen aspect instead of
+        // the ratio the user actually picked.
+        if let mv = metalView, mv.frame.width > 0, mv.frame.height > 0 {
+            return mv.frame.width / mv.frame.height
+        }
+        let b = bounds
+        guard b.width > 0, b.height > 0 else { return 0 }
+        return b.width / b.height
+    }
+
+    /// Mirror an image horizontally — used for front-camera selfies so the saved photo matches
+    /// the mirrored live preview (which is mirrored at the videoOutput connection level).
+    private func mirrorHorizontally(_ image: CIImage) -> CIImage {
+        let extent = image.extent
+        let transform = CGAffineTransform(scaleX: -1, y: 1).translatedBy(x: -extent.width - 2 * extent.origin.x, y: 0)
+        return image.transformed(by: transform)
+    }
+
+    /// Crops a CIImage to match a target view aspect ratio with a centered crop —
+    /// the same crop the preview's aspectFill applies during live rendering.
+    private func cropToPreviewAspect(_ image: CIImage, previewAspect: CGFloat) -> CIImage {
+        guard previewAspect > 0 else { return image }
+        let extent = image.extent
+        guard extent.width > 0, extent.height > 0 else { return image }
+        let imageAspect = extent.width / extent.height
+        let crop: CGRect
+        if previewAspect > imageAspect {
+            // Preview is wider — keep full width, crop top/bottom.
+            let newHeight = extent.width / previewAspect
+            let yOffset = (extent.height - newHeight) / 2
+            crop = CGRect(x: extent.origin.x, y: extent.origin.y + yOffset,
+                          width: extent.width, height: newHeight)
+        } else {
+            // Preview is narrower — keep full height, crop left/right.
+            let newWidth = extent.height * previewAspect
+            let xOffset = (extent.width - newWidth) / 2
+            crop = CGRect(x: extent.origin.x + xOffset, y: extent.origin.y,
+                          width: newWidth, height: extent.height)
+        }
+        // Translate the cropped image back to origin so the resulting extent has origin.zero.
+        return image.cropped(to: crop)
+            .transformed(by: CGAffineTransform(translationX: -crop.origin.x, y: -crop.origin.y))
     }
 
     public func startCamera() {
@@ -542,7 +598,12 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
             } else {
                 if photoConnection.isVideoOrientationSupported { photoConnection.videoOrientation = .portrait }
             }
-            if photoConnection.isVideoMirroringSupported { photoConnection.isVideoMirrored = (newPosition == .front) }
+            // Disable hardware mirror on photo connection — iOS's behavior here is inconsistent across
+            // versions (sometimes only EXIF flag, sometimes pixels). We mirror in CIImage instead.
+            if photoConnection.isVideoMirroringSupported {
+                photoConnection.automaticallyAdjustsVideoMirroring = false
+                photoConnection.isVideoMirrored = false
+            }
         }
 
         if #available(iOS 16.0, *) {
@@ -839,7 +900,35 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
             return
         }
 
-        let (videoWidth, videoHeight, videoBitrate) = videoSettingsForCurrentPreset()
+        let (presetWidth, presetHeight, videoBitrate) = videoSettingsForCurrentPreset()
+
+        // Derive output dimensions from the preview aspect so the recorded video matches what the user
+        // sees in the preview. Keep the preset's longer side as our longer side and compute the shorter.
+        // (H.264 requires even dimensions.)
+        let previewAspect: CGFloat
+        if Thread.isMainThread {
+            previewAspect = previewAspectRatio()
+        } else {
+            var fetched: CGFloat = 0
+            DispatchQueue.main.sync { fetched = self.previewAspectRatio() }
+            previewAspect = fetched
+        }
+
+        let aspect = previewAspect > 0 ? previewAspect : CGFloat(presetWidth) / CGFloat(presetHeight)
+        let longest = max(presetWidth, presetHeight)
+        var outW: Int
+        var outH: Int
+        if aspect >= 1 {
+            outW = longest
+            outH = Int((CGFloat(longest) / aspect).rounded())
+        } else {
+            outH = longest
+            outW = Int((CGFloat(longest) * aspect).rounded())
+        }
+        outW &= ~1
+        outH &= ~1
+        let videoWidth = max(outW, 2)
+        let videoHeight = max(outH, 2)
 
         let videoSettings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
@@ -1197,34 +1286,39 @@ extension BeautyCameraView: AVCapturePhotoCaptureDelegate {
         }
 
         let filtersActive = filterProcessor.hasActiveFilters()
+        let previewAspect = pendingPreviewAspect
+        pendingPreviewAspect = 0
+        let isFront = (currentCameraPosition == .front)
 
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
 
-            if filtersActive {
-                guard let ciImage = CIImage(data: imageData, options: [.applyOrientationProperty: true]) else {
-                    DispatchQueue.main.async { completion(.failure(BeautyCameraError.captureError("Failed to decode image for filtering"))) }
-                    return
-                }
-                self.filterProcessor.invalidateSegmentationCache()
-                let filteredImage = self.filterProcessor.processImage(ciImage)
-                let p3 = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
-                guard let cgImage = self.ciContext?.createCGImage(filteredImage, from: filteredImage.extent, format: .RGBA8, colorSpace: p3) else {
-                    DispatchQueue.main.async { completion(.failure(BeautyCameraError.captureError("Failed to render filtered photo"))) }
-                    return
-                }
-                guard let fileURL = self.saveCGImageAsHEIC(cgImage) else {
-                    DispatchQueue.main.async { completion(.failure(BeautyCameraError.saveError("Failed to encode filtered photo as HEIC"))) }
-                    return
-                }
-                self.savePhotoAndReturn(fileURL: fileURL, completion: completion)
-            } else {
-                guard let fileURL = self.saveRawDataAsHEIC(imageData) else {
-                    DispatchQueue.main.async { completion(.failure(BeautyCameraError.saveError("Failed to write HEIC photo"))) }
-                    return
-                }
-                self.savePhotoAndReturn(fileURL: fileURL, completion: completion)
+            // Decode → optionally filter → mirror (front only) → crop to preview aspect → encode.
+            // This guarantees the saved image is the exact rectangle the user saw in live preview.
+            guard let ciImage = CIImage(data: imageData, options: [.applyOrientationProperty: true]) else {
+                DispatchQueue.main.async { completion(.failure(BeautyCameraError.captureError("Failed to decode captured photo"))) }
+                return
             }
+
+            var output: CIImage = ciImage
+            if filtersActive {
+                self.filterProcessor.invalidateSegmentationCache()
+                output = self.filterProcessor.processImage(ciImage)
+            }
+            // Match the live preview's left-right orientation for selfie shots.
+            if isFront { output = self.mirrorHorizontally(output) }
+            output = self.cropToPreviewAspect(output, previewAspect: previewAspect)
+
+            let p3 = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
+            guard let cgImage = self.ciContext?.createCGImage(output, from: output.extent, format: .RGBA8, colorSpace: p3) else {
+                DispatchQueue.main.async { completion(.failure(BeautyCameraError.captureError("Failed to render captured photo"))) }
+                return
+            }
+            guard let fileURL = self.saveCGImageAsHEIC(cgImage) else {
+                DispatchQueue.main.async { completion(.failure(BeautyCameraError.saveError("Failed to encode captured photo as HEIC"))) }
+                return
+            }
+            self.savePhotoAndReturn(fileURL: fileURL, completion: completion)
         }
     }
 }
