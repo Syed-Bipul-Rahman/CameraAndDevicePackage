@@ -252,7 +252,9 @@ final class ExpandableOptionButton: UIView {
             selectedLabel.text = label
         }
         selectedCircle.backgroundColor = .clear
-        updateOptionsStack()
+        // Labels are NOT added here — they're built lazily on expand() and torn down on collapse(),
+        // so the collapsed state has zero arranged subviews and no UISV-spacing constraints to conflict
+        // with the 32 pt width.
     }
 
     func setSelected(_ value: String) {
@@ -260,10 +262,13 @@ final class ExpandableOptionButton: UIView {
         if iconImage == nil {
             selectedLabel.text = value
         }
-        updateOptionsStack()
+        // Only rebuild if currently visible — otherwise leave the stack empty.
+        if !optionsStack.isHidden {
+            buildOptionLabels()
+        }
     }
 
-    private func updateOptionsStack() {
+    private func buildOptionLabels() {
         optionsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         for opt in options where opt != selectedValue {
             let lbl = UILabel()
@@ -278,32 +283,42 @@ final class ExpandableOptionButton: UIView {
         }
     }
 
+    private func clearOptionLabels() {
+        optionsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+    }
+
     func expand() {
         selectedCircle.backgroundColor = iconImage != nil ? UIColor(white: 0.55, alpha: 1) : .white
         if iconImage == nil { selectedLabel.textColor = UIColor(red: 0.2, green: 0.2, blue: 0.2, alpha: 1) }
 
-        // Bring the stack into layout before animating width so the labels can fit during the expand.
-        optionsStack.isHidden = false
-        UIView.animate(withDuration: 0.2, delay: 0, options: .curveEaseOut) {
+        // Phase 1: widen with no labels in the stack, so the 32 pt width never conflicts with label spacing.
+        UIView.animate(withDuration: 0.15, delay: 0, options: .curveEaseOut, animations: {
             self.widthConstraint.constant = self.expandedWidth
             self.layoutIfNeeded()
-        }
-        UIView.animate(withDuration: 0.14, delay: 0.06) {
-            self.optionsStack.alpha = 1
-        }
+        }, completion: { _ in
+            // Phase 2: build labels and fade them in inside the now-wide button.
+            self.buildOptionLabels()
+            self.optionsStack.alpha = 0
+            self.optionsStack.isHidden = false
+            UIView.animate(withDuration: 0.15) { self.optionsStack.alpha = 1 }
+        })
     }
 
     func collapse() {
         selectedCircle.backgroundColor = .clear
         selectedLabel.textColor = .black
 
-        UIView.animate(withDuration: 0.2, animations: {
+        // Phase 1: fade labels out while the button is still wide (no conflict).
+        UIView.animate(withDuration: 0.15, animations: {
             self.optionsStack.alpha = 0
-            self.widthConstraint.constant = self.collapsedWidth
-            self.layoutIfNeeded()
         }, completion: { _ in
-            // Take the stack out of layout once collapsed so it can't fight the 32pt width constraint.
+            // Phase 2: remove labels first so the 32 pt width has no inner constraints to fight.
             self.optionsStack.isHidden = true
+            self.clearOptionLabels()
+            UIView.animate(withDuration: 0.15) {
+                self.widthConstraint.constant = self.collapsedWidth
+                self.layoutIfNeeded()
+            }
         })
     }
 

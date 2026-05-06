@@ -83,8 +83,58 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
     private func commonInit() {
         backgroundColor = .black
         setupMetal()
+        configureAudioSession()
+        registerSessionObservers()
         sessionQueue.async { [weak self] in
             self?.setupCamera()
+        }
+    }
+
+    /// Configure the shared AVAudioSession so AVFoundation can mix our mic capture cleanly with system audio.
+    /// Without this, real devices produce FigAudioSession err=-19224 and the capture session can wedge.
+    private func configureAudioSession() {
+        let audio = AVAudioSession.sharedInstance()
+        do {
+            try audio.setCategory(.playAndRecord,
+                                  mode: .videoRecording,
+                                  options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
+            try audio.setActive(true, options: [])
+        } catch {
+            // Non-fatal — capture still works, but routing may be suboptimal.
+        }
+    }
+
+    /// Recover from interruptions (incoming call, Control Center, screen lock, audio route change)
+    /// and from runtime errors. Without these, the preview freezes after the first interruption.
+    private func registerSessionObservers() {
+        let nc = NotificationCenter.default
+        nc.addObserver(self, selector: #selector(sessionRuntimeError(_:)),
+                       name: .AVCaptureSessionRuntimeError, object: nil)
+        nc.addObserver(self, selector: #selector(sessionInterruptionEnded(_:)),
+                       name: .AVCaptureSessionInterruptionEnded, object: nil)
+        nc.addObserver(self, selector: #selector(applicationDidBecomeActive(_:)),
+                       name: UIApplication.didBecomeActiveNotification, object: nil)
+    }
+
+    @objc private func sessionRuntimeError(_ note: Notification) {
+        // Most runtime errors are recoverable by simply restarting the session on its queue.
+        sessionQueue.async { [weak self] in
+            guard let self = self, let session = self.captureSession else { return }
+            if !session.isRunning { session.startRunning() }
+        }
+    }
+
+    @objc private func sessionInterruptionEnded(_ note: Notification) {
+        sessionQueue.async { [weak self] in
+            guard let self = self, let session = self.captureSession else { return }
+            if !session.isRunning { session.startRunning() }
+        }
+    }
+
+    @objc private func applicationDidBecomeActive(_ note: Notification) {
+        sessionQueue.async { [weak self] in
+            guard let self = self, let session = self.captureSession else { return }
+            if !session.isRunning { session.startRunning() }
         }
     }
 
@@ -217,11 +267,21 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
         let session = AVCaptureSession()
         session.sessionPreset = .photo
 
+        // All input/output additions must live between begin/commit so the session never
+        // observes a partially configured state. Without this, real devices intermittently wedge.
+        session.beginConfiguration()
+        defer { session.commitConfiguration() }
+
         guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
             return
         }
 
         do {
+            // Add the input first; configure device properties after, since some properties
+            // (active frame durations) only validate against an attached, running format.
+            let input = try AVCaptureDeviceInput(device: camera)
+            if session.canAddInput(input) { session.addInput(input) }
+
             try camera.lockForConfiguration()
             if camera.isExposureModeSupported(.continuousAutoExposure) {
                 camera.exposureMode = .continuousAutoExposure
@@ -232,9 +292,6 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
             camera.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
             camera.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
             camera.unlockForConfiguration()
-
-            let input = try AVCaptureDeviceInput(device: camera)
-            if session.canAddInput(input) { session.addInput(input) }
         } catch {
             return
         }
@@ -283,7 +340,8 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
         photoOutput = photoOut
 
         setupAudioCapture(session: session)
-        session.startRunning()
+        // Note: don't startRunning() here — viewDidAppear's startCamera() owns lifecycle.
+        // Starting twice from two paths makes the session race with itself.
     }
 
     private func setupAudioCapture(session: AVCaptureSession) {
@@ -1031,6 +1089,8 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
     deinit { cleanup() }
 
     private func cleanup() {
+        NotificationCenter.default.removeObserver(self)
+
         imageLock.lock()
         isCleanedUp = true
         imageLock.unlock()
@@ -1039,11 +1099,16 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
         metalView?.delegate = nil
         videoOutput?.setSampleBufferDelegate(nil, queue: nil)
 
-        sessionQueue.sync {
-            captureSession?.stopRunning()
-            if let session = captureSession {
-                session.inputs.forEach { session.removeInput($0) }
-                session.outputs.forEach { session.removeOutput($0) }
+        // Capture refs locally so the async block doesn't touch self after it's deallocated.
+        // sessionQueue.sync from deinit can deadlock if the queue is mid-stopRunning posting
+        // notifications back to main — and on real devices that occasionally manifests as a
+        // main-thread stack overflow (EXC_BAD_ACCESS code=2). Async tear-down avoids it.
+        let sessionRef = captureSession
+        sessionQueue.async {
+            sessionRef?.stopRunning()
+            if let s = sessionRef {
+                s.inputs.forEach { s.removeInput($0) }
+                s.outputs.forEach { s.removeOutput($0) }
             }
         }
 
