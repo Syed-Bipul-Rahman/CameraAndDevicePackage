@@ -176,9 +176,8 @@ public final class FilterControlPanelView: UIView {
         var settings = FilterSettings()
         settings.faceOnlySmooth = smooth > 0
         settings.faceSmoothIntensity = smooth / 100
-        // Contrast locked to the value the old slider produced at its maximum (100):
-        // old formula was 0.5 + value/100, so value=100 → 1.5 in CIColorControls.
-        settings.contrast = 1.5
+        // Contrast slider removed; locked to a fixed punchy value.
+        settings.contrast = 1.4
         settings.lipPlump = plump != 0
         settings.lipPlumpIntensity = plump / 100
         settings.milkySkin = milky > 0

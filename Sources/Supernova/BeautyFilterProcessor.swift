@@ -22,9 +22,8 @@ class BeautyFilterProcessor {
     var faceColorTintIntensity: Float = 0.3
 
     var brightness: Float = 0.0
-    // Locked to slider value 100 in the old UI (formula: 0.5 + value/100). Contrast slider was removed
-    // from the panel; keep the default at 1.5 so every frame ships with the punchy look.
-    var contrast: Float = 1.5
+    // Contrast slider was removed from the panel; ship every frame with a fixed punchy look.
+    var contrast: Float = 1.4
     var saturation: Float = 1.0
 
     var lipPlumpEnabled: Bool = false

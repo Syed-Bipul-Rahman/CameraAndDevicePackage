@@ -13,7 +13,7 @@ public struct FilterSettings {
     public var faceColorTintBlue: Float = 0.0
     public var faceColorTintIntensity: Float = 0.3
     public var brightness: Float = 0.0
-    public var contrast: Float = 1.5
+    public var contrast: Float = 1.4
     public var saturation: Float = 1.0
     public var lipPlump: Bool = false
     public var lipPlumpIntensity: Float = 0.0
