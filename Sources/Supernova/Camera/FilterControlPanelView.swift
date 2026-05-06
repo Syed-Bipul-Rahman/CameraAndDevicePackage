@@ -8,7 +8,6 @@ public final class FilterControlPanelView: UIView {
 
     // Callbacks — called on every slider change
     public var onSmoothChanged:    ((Float) -> Void)?
-    public var onContrastChanged:  ((Float) -> Void)?
     public var onPlumpChanged:     ((Float) -> Void)?
     public var onMilkyChanged:     ((Float) -> Void)?
     public var onBlurChanged:      ((Float) -> Void)?
@@ -17,7 +16,6 @@ public final class FilterControlPanelView: UIView {
 
     // Current values (0-100 scale matching Flutter)
     public private(set) var smooth:   Float = 0
-    public private(set) var contrast: Float = 50
     public private(set) var plump:    Float = 0
     public private(set) var milky:    Float = 0
     public private(set) var blur:     Float = 0
@@ -25,7 +23,6 @@ public final class FilterControlPanelView: UIView {
     private let blurBackground = UIVisualEffectView(effect: UIBlurEffect(style: .regular))
 
     private lazy var smoothRow    = makeSliderRow(label: "Smooth",   min: 0,    max: 100, value: smooth)
-    private lazy var contrastRow  = makeSliderRow(label: "Contrast", min: 0,    max: 100, value: contrast)
     private lazy var plumpRow     = makeSliderRow(label: "Plump",    min: -100, max: 100, value: plump)
     private lazy var milkyRow     = makeSliderRow(label: "Milky",    min: 0,    max: 100, value: milky)
     private lazy var blurRow      = makeSliderRow(label: "Blur",     min: 0,    max: 100, value: blur)
@@ -40,12 +37,11 @@ public final class FilterControlPanelView: UIView {
         setup()
     }
 
-    public func configure(smooth: Float, contrast: Float, plump: Float, milky: Float, blur: Float) {
-        self.smooth   = smooth;   smoothRow.slider.value   = smooth
-        self.contrast = contrast; contrastRow.slider.value = contrast
-        self.plump    = plump;    plumpRow.slider.value    = plump
-        self.milky    = milky;    milkyRow.slider.value    = milky
-        self.blur     = blur;     blurRow.slider.value     = blur
+    public func configure(smooth: Float, plump: Float, milky: Float, blur: Float) {
+        self.smooth = smooth; smoothRow.slider.value = smooth
+        self.plump  = plump;  plumpRow.slider.value  = plump
+        self.milky  = milky;  milkyRow.slider.value  = milky
+        self.blur   = blur;   blurRow.slider.value   = blur
         updateAllLabels()
     }
 
@@ -87,14 +83,13 @@ public final class FilterControlPanelView: UIView {
 
         // Slider rows wired up
         smoothRow.slider.addTarget(self, action: #selector(smoothChanged(_:)), for: .valueChanged)
-        contrastRow.slider.addTarget(self, action: #selector(contrastChanged(_:)), for: .valueChanged)
         plumpRow.slider.addTarget(self, action: #selector(plumpChanged(_:)), for: .valueChanged)
         milkyRow.slider.addTarget(self, action: #selector(milkyChanged(_:)), for: .valueChanged)
         blurRow.slider.addTarget(self, action: #selector(blurChanged(_:)), for: .valueChanged)
 
         let stack = UIStackView(arrangedSubviews: [
             header, divider,
-            smoothRow, contrastRow, plumpRow, milkyRow, blurRow
+            smoothRow, plumpRow, milkyRow, blurRow
         ])
         stack.axis = .vertical
         stack.spacing = 6
@@ -134,11 +129,10 @@ public final class FilterControlPanelView: UIView {
     }
 
     private func updateAllLabels() {
-        smoothRow.valueLabel.text   = "\(Int(smooth))"
-        contrastRow.valueLabel.text = "\(Int(contrast))"
-        plumpRow.valueLabel.text    = "\(Int(plump))"
-        milkyRow.valueLabel.text    = "\(Int(milky))"
-        blurRow.valueLabel.text     = "\(Int(blur))"
+        smoothRow.valueLabel.text = "\(Int(smooth))"
+        plumpRow.valueLabel.text  = "\(Int(plump))"
+        milkyRow.valueLabel.text  = "\(Int(milky))"
+        blurRow.valueLabel.text   = "\(Int(blur))"
     }
 
     // MARK: - Actions
@@ -149,13 +143,6 @@ public final class FilterControlPanelView: UIView {
         smooth = slider.value
         smoothRow.valueLabel.text = "\(Int(smooth))"
         onSmoothChanged?(smooth)
-        notifySettings()
-    }
-
-    @objc private func contrastChanged(_ slider: UISlider) {
-        contrast = slider.value
-        contrastRow.valueLabel.text = "\(Int(contrast))"
-        onContrastChanged?(contrast)
         notifySettings()
     }
 
@@ -172,7 +159,6 @@ public final class FilterControlPanelView: UIView {
         // Milky is exclusive — reset other filters
         if milky > 0 {
             smooth = 0; smoothRow.slider.value = 0; smoothRow.valueLabel.text = "0"
-            contrast = 50; contrastRow.slider.value = 50; contrastRow.valueLabel.text = "50"
             plump = 0; plumpRow.slider.value = 0; plumpRow.valueLabel.text = "0"
         }
         onMilkyChanged?(milky)
@@ -190,7 +176,9 @@ public final class FilterControlPanelView: UIView {
         var settings = FilterSettings()
         settings.faceOnlySmooth = smooth > 0
         settings.faceSmoothIntensity = smooth / 100
-        settings.contrast = 0.5 + contrast / 100
+        // Contrast locked to the value the old slider produced at its maximum (100):
+        // old formula was 0.5 + value/100, so value=100 → 1.5 in CIColorControls.
+        settings.contrast = 1.5
         settings.lipPlump = plump != 0
         settings.lipPlumpIntensity = plump / 100
         settings.milkySkin = milky > 0

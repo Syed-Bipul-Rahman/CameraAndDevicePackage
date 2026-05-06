@@ -37,7 +37,6 @@ open class CameraScreenViewController: UIViewController {
 
     // Filter slider values
     private var filterSmooth:   Float = 0
-    private var filterContrast: Float = 50
     private var filterPlump:    Float = 0
     private var filterMilky:    Float = 0
     private var filterBlur:     Float = 0
@@ -353,12 +352,11 @@ open class CameraScreenViewController: UIViewController {
     private func showFilterPanel() {
         isShowFilterControl = true
         let panel = FilterControlPanelView()
-        panel.configure(smooth: filterSmooth, contrast: filterContrast, plump: filterPlump, milky: filterMilky, blur: filterBlur)
+        panel.configure(smooth: filterSmooth, plump: filterPlump, milky: filterMilky, blur: filterBlur)
         panel.onClose = { [weak self] in self?.hideFilterPanel() }
         panel.onSmoothChanged    = { [weak self] v in self?.filterSmooth = v }
-        panel.onContrastChanged  = { [weak self] v in self?.filterContrast = v }
         panel.onPlumpChanged     = { [weak self] v in self?.filterPlump = v }
-        panel.onMilkyChanged     = { [weak self] v in self?.filterMilky = v; if v > 0 { self?.filterSmooth = 0; self?.filterContrast = 50; self?.filterPlump = 0 } }
+        panel.onMilkyChanged     = { [weak self] v in self?.filterMilky = v; if v > 0 { self?.filterSmooth = 0; self?.filterPlump = 0 } }
         panel.onBlurChanged      = { [weak self] v in self?.filterBlur = v }
         panel.onFilterSettingsChanged = { [weak self] settings in
             self?.filterSettings = settings
