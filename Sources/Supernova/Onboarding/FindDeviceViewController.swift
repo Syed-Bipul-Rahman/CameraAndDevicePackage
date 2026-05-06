@@ -63,12 +63,14 @@ public final class FindDeviceViewController: UIViewController {
         radarView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(radarView)
 
-        // Status label
+        // Status label — single line and fixed height so the table doesn't jump as text changes.
         statusLabel.text = "Searching for nearby devices..."
         statusLabel.font = .systemFont(ofSize: 18, weight: .medium)
         statusLabel.textColor = darkGrey
         statusLabel.textAlignment = .center
-        statusLabel.numberOfLines = 0
+        statusLabel.numberOfLines = 1
+        statusLabel.adjustsFontSizeToFitWidth = true
+        statusLabel.minimumScaleFactor = 0.8
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(statusLabel)
 
@@ -96,9 +98,10 @@ public final class FindDeviceViewController: UIViewController {
             radarView.widthAnchor.constraint(equalToConstant: 150),
             radarView.heightAnchor.constraint(equalToConstant: 150),
 
-            statusLabel.topAnchor.constraint(equalTo: radarView.bottomAnchor, constant: 0),
+            statusLabel.topAnchor.constraint(equalTo: radarView.bottomAnchor, constant: 12),
             statusLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
             statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            statusLabel.heightAnchor.constraint(equalToConstant: 28),
 
             tableView.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 8),
             tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
@@ -122,22 +125,29 @@ public final class FindDeviceViewController: UIViewController {
 
         ble.$discoveredDevices
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] devices in
-                self?.devices = devices.sorted { $0.rssi > $1.rssi }
-                self?.tableView.reloadData()
-                self?.updateStatus()
+            // Only react when the set of device IDs actually changes — ignores noisy RSSI updates
+            // that would otherwise reload the table and resize the status label many times per second.
+            .map { $0.map(\.id) }
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                guard let self = self, let latest = self.bleService?.discoveredDevices else { return }
+                self.devices = latest.sorted { $0.rssi > $1.rssi }
+                self.tableView.reloadData()
+                self.refreshDeviceCountLabel()
             }.store(in: &cancellables)
 
         ble.$connectionState
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in
-                self?.isScanning = state == .scanning
-                self?.updateStatus()
+                self?.applyScanningState(state == .scanning)
             }.store(in: &cancellables)
     }
 
-    private func updateStatus() {
-        if isScanning {
+    /// Called only on transitions in/out of scanning — never on per-device updates.
+    private func applyScanningState(_ scanning: Bool) {
+        guard scanning != isScanning else { return }
+        isScanning = scanning
+        if scanning {
             statusLabel.text = "Searching for nearby devices..."
             radarView.startAnimating()
             scanButton.isHidden = true
@@ -150,6 +160,14 @@ public final class FindDeviceViewController: UIViewController {
             radarView.stopAnimating()
             scanButton.isHidden = true
         }
+    }
+
+    /// Called when the device list changes mid-scan. Updates only the count text — never the radar.
+    private func refreshDeviceCountLabel() {
+        guard isScanning else { return }
+        statusLabel.text = devices.isEmpty
+            ? "Searching for nearby devices..."
+            : "Found \(devices.count) device(s)"
     }
 
     @objc private func backTapped() {
@@ -252,37 +270,122 @@ private final class DeviceCell: UITableViewCell {
 // MARK: - RadarView
 
 private final class RadarView: UIView {
+    private let core = UIView()
     private let iconView = UIImageView(image: UIImage(systemName: "bluetooth"))
-    private var pulseLayer: CAShapeLayer?
+    private var pulseLayers: [CAShapeLayer] = []
+    private var isAnimating = false
+    private var lastBounds: CGRect = .zero
+
+    private let accent = UIColor(red: 0.294, green: 0.294, blue: 0.310, alpha: 1)
+    private let pulseCount = 3
+    private let pulseDuration: CFTimeInterval = 2.4
+    private let coreRadius: CGFloat = 24
+    private let maxScale: CGFloat = 2.6
 
     override init(frame: CGRect) {
         super.init(frame: frame)
-        backgroundColor = UIColor(red: 0.937, green: 0.937, blue: 0.937, alpha: 1)
-        layer.cornerRadius = 75
-        layer.shadowColor = UIColor.black.cgColor; layer.shadowOpacity = 0.1; layer.shadowRadius = 20; layer.shadowOffset = .zero
-        iconView.tintColor = UIColor(red: 0.294, green: 0.294, blue: 0.310, alpha: 1)
+        backgroundColor = .clear
+        clipsToBounds = false
+
+        core.backgroundColor = accent
+        core.layer.cornerRadius = coreRadius
+        core.layer.shadowColor = accent.cgColor
+        core.layer.shadowOpacity = 0.35
+        core.layer.shadowRadius = 14
+        core.layer.shadowOffset = .zero
+        core.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(core)
+
+        iconView.tintColor = .white
         iconView.contentMode = .scaleAspectFit
         iconView.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(iconView)
-        NSLayoutConstraint.activate([iconView.centerXAnchor.constraint(equalTo: centerXAnchor), iconView.centerYAnchor.constraint(equalTo: centerYAnchor), iconView.widthAnchor.constraint(equalToConstant: 50), iconView.heightAnchor.constraint(equalToConstant: 50)])
+        core.addSubview(iconView)
+
+        NSLayoutConstraint.activate([
+            core.centerXAnchor.constraint(equalTo: centerXAnchor),
+            core.centerYAnchor.constraint(equalTo: centerYAnchor),
+            core.widthAnchor.constraint(equalToConstant: coreRadius * 2),
+            core.heightAnchor.constraint(equalToConstant: coreRadius * 2),
+            iconView.centerXAnchor.constraint(equalTo: core.centerXAnchor),
+            iconView.centerYAnchor.constraint(equalTo: core.centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 24),
+            iconView.heightAnchor.constraint(equalToConstant: 24),
+        ])
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        // Only rebuild pulse paths if the bounds actually changed; otherwise leave running animations alone.
+        guard bounds != lastBounds, !pulseLayers.isEmpty else { return }
+        lastBounds = bounds
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for layer in pulseLayers {
+            layer.frame = bounds
+            layer.path = circlePath().cgPath
+        }
+        CATransaction.commit()
+    }
+
+    private func circlePath() -> UIBezierPath {
+        UIBezierPath(
+            arcCenter: CGPoint(x: bounds.midX, y: bounds.midY),
+            radius: coreRadius,
+            startAngle: 0, endAngle: .pi * 2, clockwise: true
+        )
+    }
+
     func startAnimating() {
-        iconView.image = UIImage(systemName: "bluetooth.searching")
-        let pulse = CAShapeLayer()
-        pulse.path = UIBezierPath(ovalIn: bounds.insetBy(dx: 10, dy: 10)).cgPath
-        pulse.fillColor = UIColor(red: 0.294, green: 0.294, blue: 0.310, alpha: 0.15).cgColor
-        layer.insertSublayer(pulse, at: 0)
-        pulseLayer = pulse
-        let anim = CABasicAnimation(keyPath: "transform.scale")
-        anim.fromValue = 0.8; anim.toValue = 1.1; anim.duration = 1; anim.repeatCount = .infinity; anim.autoreverses = true
-        pulse.add(anim, forKey: "pulse")
+        // Idempotent: don't tear down and rebuild if already running.
+        guard !isAnimating else { return }
+        isAnimating = true
+        lastBounds = bounds
+
+        for i in 0..<pulseCount {
+            let pulse = CAShapeLayer()
+            pulse.frame = bounds
+            pulse.path = circlePath().cgPath
+            pulse.fillColor = accent.withAlphaComponent(0.08).cgColor
+            pulse.strokeColor = accent.withAlphaComponent(0.55).cgColor
+            pulse.lineWidth = 1.5
+            pulse.opacity = 0
+            layer.insertSublayer(pulse, at: 0)
+            pulseLayers.append(pulse)
+
+            let scale = CABasicAnimation(keyPath: "transform.scale")
+            scale.fromValue = 1.0
+            scale.toValue = maxScale
+
+            let opacity = CAKeyframeAnimation(keyPath: "opacity")
+            opacity.values = [0.0, 0.8, 0.0]
+            opacity.keyTimes = [0.0, 0.15, 1.0]
+
+            let group = CAAnimationGroup()
+            group.animations = [scale, opacity]
+            group.duration = pulseDuration
+            group.repeatCount = .infinity
+            group.beginTime = CACurrentMediaTime() + Double(i) * (pulseDuration / Double(pulseCount))
+            group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            pulse.add(group, forKey: "pulse")
+        }
+
+        let breathe = CABasicAnimation(keyPath: "transform.scale")
+        breathe.fromValue = 1.0
+        breathe.toValue = 1.08
+        breathe.duration = 1.2
+        breathe.autoreverses = true
+        breathe.repeatCount = .infinity
+        breathe.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        core.layer.add(breathe, forKey: "breathe")
     }
 
     func stopAnimating() {
-        iconView.image = UIImage(systemName: "bluetooth")
-        pulseLayer?.removeFromSuperlayer(); pulseLayer = nil
+        guard isAnimating else { return }
+        isAnimating = false
+        pulseLayers.forEach { $0.removeFromSuperlayer() }
+        pulseLayers.removeAll()
+        core.layer.removeAnimation(forKey: "breathe")
     }
 }

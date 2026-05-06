@@ -183,8 +183,9 @@ extension BLEService: CBCentralManagerDelegate {
         let device = DiscoveredDevice(id: peripheral.identifier, name: name, rssi: RSSI.intValue, peripheral: peripheral)
 
         if let idx = discoveredDevices.firstIndex(where: { $0.id == device.id }) {
-            // Update RSSI / name as scan responses come in.
-            if discoveredDevices[idx].rssi != device.rssi || discoveredDevices[idx].name != device.name {
+            // Only re-emit when the name changes (e.g. scan response arrives). RSSI fluctuates several times
+            // per second; emitting on every change floods @Published subscribers and causes UI jitter.
+            if discoveredDevices[idx].name != device.name {
                 discoveredDevices[idx] = device
             }
         } else {

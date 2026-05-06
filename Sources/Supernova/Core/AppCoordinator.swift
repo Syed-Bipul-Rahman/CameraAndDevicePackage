@@ -4,12 +4,11 @@ import UIKit
 /// Create one instance in your AppDelegate / SceneDelegate and call `start()`.
 ///
 /// Flow:
-///   Splash (3s) → Onboarding 1 (video + auto-advance 6s) → Onboarding 2 (video + button)
-///   → Find Device → Connecting → Onboarding 4 (home screen)
+///   Splash (3s) → Welcome (video + auto-advance 6s) → GetStarted (video + button)
+///   → Find Device → Connecting → Home
 ///   Home: Camera | Light Control | Gallery
 ///
-/// If the user has already completed onboarding (persist a flag in UserDefaults),
-/// jump straight to the home screen.
+/// Returning users skip the welcome / get-started screens but must still pair a device.
 public final class AppCoordinator {
 
     private let window: UIWindow
@@ -40,18 +39,18 @@ public final class AppCoordinator {
 
     private func showSplash() {
         let vc = SplashViewController()
-        vc.onFinished = { [weak self] in self?.showOnboarding1() }
+        vc.onFinished = { [weak self] in self?.showWelcome() }
         navigationController.setViewControllers([vc], animated: false)
     }
 
-    private func showOnboarding1() {
+    private func showWelcome() {
         let vc = OnboardingVideoViewController()
         vc.config = .init(videoName: "light1", buttonTitle: "Let's Get Started", buttonStyle: .outlined, autoAdvanceAfter: 6)
-        vc.onAction = { [weak self] in self?.showOnboarding2() }
+        vc.onAction = { [weak self] in self?.showGetStarted() }
         navigationController.setViewControllers([vc], animated: true)
     }
 
-    private func showOnboarding2() {
+    private func showGetStarted() {
         let vc = OnboardingVideoViewController()
         vc.config = .init(videoName: "light2", buttonTitle: "Let's Get Started", buttonStyle: .filled)
         vc.onAction = { [weak self] in self?.showFindDevice() }
@@ -72,11 +71,11 @@ public final class AppCoordinator {
         vc.bleService = bleService
         vc.device = device
         vc.onConnected = { [weak self] in
-            // First-time users go through onboarding 4; returning users go straight home.
+            // First-time pairing animates into the home screen; returning users replace the stack silently.
             if UserDefaults.standard.bool(forKey: Self.onboardingDoneKey) {
                 self?.showHome()
             } else {
-                self?.showOnboarding4()
+                self?.showHomeAfterPairing()
             }
         }
         vc.onRetry = { [weak self] in
@@ -85,13 +84,12 @@ public final class AppCoordinator {
         navigationController.pushViewController(vc, animated: true)
     }
 
-    private func showOnboarding4() {
+    private func showHomeAfterPairing() {
         navigationController.setNavigationBarHidden(true, animated: false)
         let homeButtons = buildHomeButtons()
         let vc = OnboardingVideoViewController()
         vc.config = .init(videoName: "light2", buttonTitle: "", buttonStyle: .filled)
         vc.centreContentView = homeButtons
-        // No CTA button needed — home buttons act as entry points
         vc.onAction = { }
         navigationController.setViewControllers([vc], animated: true)
         UserDefaults.standard.set(true, forKey: Self.onboardingDoneKey)
