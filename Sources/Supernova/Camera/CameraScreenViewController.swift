@@ -507,17 +507,6 @@ extension CameraScreenViewController: CameraAppBarViewDelegate {
         cameraView.setAspectRatio(ratio)
     }
 
-    public func cameraAppBar(_ bar: CameraAppBarView, didChangeQuality value: String) {
-        let quality: VideoQuality
-        switch value {
-        case "SD": quality = .sd
-        case "FHD": quality = .fullHD
-        case "4K": quality = .uhd4K
-        default: quality = .hd
-        }
-        cameraView.setQuality(quality)
-    }
-
     public func cameraAppBar(_ bar: CameraAppBarView, didChangeZoom value: String) {
         let factor: CGFloat = CGFloat(Double(value.replacingOccurrences(of: "x", with: "")) ?? 1.0)
         cameraView.setZoom(factor)

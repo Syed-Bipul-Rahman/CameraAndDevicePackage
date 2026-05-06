@@ -52,10 +52,6 @@ open class BeautyCameraViewController: UIViewController {
         cameraView.setAspectRatio(ratio)
     }
 
-    public func setQuality(_ quality: VideoQuality) {
-        cameraView.setQuality(quality)
-    }
-
     public func setZoom(_ factor: CGFloat) {
         cameraView.setZoom(factor)
     }

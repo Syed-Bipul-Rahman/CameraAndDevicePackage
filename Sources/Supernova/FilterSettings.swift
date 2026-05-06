@@ -37,9 +37,3 @@ public enum AspectRatio: String {
     case standard = "4:3"
 }
 
-public enum VideoQuality: String {
-    case sd = "SD"
-    case hd = "HD"
-    case fullHD = "FHD"
-    case uhd4K = "4K"
-}

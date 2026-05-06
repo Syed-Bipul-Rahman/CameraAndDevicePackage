@@ -5,7 +5,6 @@ import UIKit
 public protocol CameraAppBarViewDelegate: AnyObject {
     func cameraAppBar(_ bar: CameraAppBarView, didChangeFlash value: String)
     func cameraAppBar(_ bar: CameraAppBarView, didChangeRatio value: String)
-    func cameraAppBar(_ bar: CameraAppBarView, didChangeQuality value: String)
     func cameraAppBar(_ bar: CameraAppBarView, didChangeZoom value: String)
     func cameraAppBar(_ bar: CameraAppBarView, didChangeTimer value: String)
     func cameraAppBar(_ bar: CameraAppBarView, didToggleFilter enabled: Bool)
@@ -23,7 +22,6 @@ public final class CameraAppBarView: UIView {
     // Current selection state
     private(set) var selectedFlash   = "Off"
     private(set) var selectedRatio   = "4:3"
-    private(set) var selectedQuality = "HD"
     private(set) var selectedZoom    = "1x"
     private(set) var selectedTimer   = "Off"
     private(set) var filterEnabled   = false
@@ -36,7 +34,6 @@ public final class CameraAppBarView: UIView {
 
     private let flashOptions   = ["Auto", "On", "Off"]
     private let ratioOptions   = ["4:3", "1:1", "16:9"]
-    private let qualityOptions = ["SD", "HD", "FHD", "4K"]
     private let zoomOptions    = ["0.6", "1x", "2x", "3x"]
     private let timerOptions   = ["Off", "3s", "5s", "10s"]
 
@@ -58,13 +55,13 @@ public final class CameraAppBarView: UIView {
         backButton.tintColor = .white
         backButton.addTarget(self, action: #selector(backTapped), for: .touchUpInside)
 
-        // Expandable options
-        let flashBtn   = makeOption(tag: 0, label: "Off",  icon: UIImage(systemName: "bolt"),         options: flashOptions)
-        let ratioBtn   = makeOption(tag: 1, label: "4:3",  icon: nil,                                 options: ratioOptions)
-        let qualityBtn = makeOption(tag: 2, label: "HD",   icon: nil,                                 options: qualityOptions)
-        let zoomBtn    = makeOption(tag: 3, label: "1x",   icon: nil,                                 options: zoomOptions)
-        let timerBtn   = makeOption(tag: 4, label: "Off",  icon: UIImage(systemName: "timer"),        options: timerOptions)
-        optionButtons  = [flashBtn, ratioBtn, qualityBtn, zoomBtn, timerBtn]
+        // Expandable options. Tag 2 (quality) intentionally skipped — the camera always picks the
+        // highest format the device supports, so there's nothing for the user to choose.
+        let flashBtn = makeOption(tag: 0, label: "Off", icon: UIImage(systemName: "bolt"),  options: flashOptions)
+        let ratioBtn = makeOption(tag: 1, label: "4:3", icon: nil,                          options: ratioOptions)
+        let zoomBtn  = makeOption(tag: 3, label: "1x",  icon: nil,                          options: zoomOptions)
+        let timerBtn = makeOption(tag: 4, label: "Off", icon: UIImage(systemName: "timer"), options: timerOptions)
+        optionButtons = [flashBtn, ratioBtn, zoomBtn, timerBtn]
 
         // Filter circle toggle
         filterButton.isOn = false
@@ -74,7 +71,7 @@ public final class CameraAppBarView: UIView {
         filterButton.addTarget(self, action: #selector(filterToggled), for: .touchUpInside)
 
         // Stack layout
-        let stack = UIStackView(arrangedSubviews: [backButton, flashBtn, ratioBtn, qualityBtn, zoomBtn, timerBtn, filterButton])
+        let stack = UIStackView(arrangedSubviews: [backButton, flashBtn, ratioBtn, zoomBtn, timerBtn, filterButton])
         stack.axis = .horizontal
         stack.alignment = .center
         stack.distribution = .equalSpacing
@@ -137,12 +134,13 @@ public final class CameraAppBarView: UIView {
     }
 
     private func handleOptionSelected(tag: Int, value: String) {
+        // Tags match the original layout (0 flash, 1 ratio, 3 zoom, 4 timer); 2 (quality) was removed.
+        // optionButtons array is now densely packed: [flash, ratio, zoom, timer] -> indices 0..3.
         switch tag {
-        case 0: selectedFlash = value;   optionButtons[0].setSelected(value); delegate?.cameraAppBar(self, didChangeFlash: value)
-        case 1: selectedRatio = value;   optionButtons[1].setSelected(value); delegate?.cameraAppBar(self, didChangeRatio: value)
-        case 2: selectedQuality = value; optionButtons[2].setSelected(value); delegate?.cameraAppBar(self, didChangeQuality: value)
-        case 3: selectedZoom = value;    optionButtons[3].setSelected(value); delegate?.cameraAppBar(self, didChangeZoom: value)
-        case 4: selectedTimer = value;   optionButtons[4].setSelected(value); delegate?.cameraAppBar(self, didChangeTimer: value)
+        case 0: selectedFlash = value; optionButtons[0].setSelected(value); delegate?.cameraAppBar(self, didChangeFlash: value)
+        case 1: selectedRatio = value; optionButtons[1].setSelected(value); delegate?.cameraAppBar(self, didChangeRatio: value)
+        case 3: selectedZoom  = value; optionButtons[2].setSelected(value); delegate?.cameraAppBar(self, didChangeZoom: value)
+        case 4: selectedTimer = value; optionButtons[3].setSelected(value); delegate?.cameraAppBar(self, didChangeTimer: value)
         default: break
         }
         collapseAll()

@@ -304,10 +304,6 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
         setAspectRatioInternal(ratio.rawValue)
     }
 
-    public func setQuality(_ quality: VideoQuality) {
-        sessionQueue.async { [weak self] in self?.setQualityInternal(quality.rawValue) }
-    }
-
     public func setZoom(_ zoomFactor: CGFloat) {
         sessionQueue.async { [weak self] in self?.setZoomInternal(zoomFactor) }
     }
@@ -340,44 +336,105 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
 
     // MARK: - Camera Setup
 
+    /// Returns the best camera device available for the given position.
+    /// Back: prefer multi-lens (Triple > DualWide > Dual > Wide) so the system can swap optical lenses on zoom.
+    /// Front: only the wide-angle exists on every iPhone.
+    private func bestCamera(position: AVCaptureDevice.Position) -> AVCaptureDevice? {
+        if position == .back {
+            let preferred: [AVCaptureDevice.DeviceType] = [
+                .builtInTripleCamera, .builtInDualWideCamera, .builtInDualCamera, .builtInWideAngleCamera
+            ]
+            for type in preferred {
+                if let cam = AVCaptureDevice.default(type, for: .video, position: .back) { return cam }
+            }
+        }
+        return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)
+    }
+
+    /// Picks the device's best format: highest still-photo dimensions, tie-breaking on highest video dims,
+    /// requiring 30fps support so live preview stays smooth.
+    private func bestFormat(for device: AVCaptureDevice) -> AVCaptureDevice.Format? {
+        let candidates = device.formats.filter { fmt in
+            fmt.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= 30 }
+        }
+        let pool = candidates.isEmpty ? device.formats : candidates
+        return pool.max { a, b in
+            let aPhoto = photoArea(of: a)
+            let bPhoto = photoArea(of: b)
+            if aPhoto != bPhoto { return aPhoto < bPhoto }
+            return videoArea(of: a) < videoArea(of: b)
+        }
+    }
+
+    private func photoArea(of fmt: AVCaptureDevice.Format) -> Int {
+        if #available(iOS 16.0, *) {
+            if let dim = fmt.supportedMaxPhotoDimensions.last {
+                return Int(dim.width) * Int(dim.height)
+            }
+        }
+        let d = fmt.highResolutionStillImageDimensions
+        return Int(d.width) * Int(d.height)
+    }
+
+    private func videoArea(of fmt: AVCaptureDevice.Format) -> Int {
+        let d = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
+        return Int(d.width) * Int(d.height)
+    }
+
+    private func applyBestFormat(_ device: AVCaptureDevice) {
+        guard let format = bestFormat(for: device) else { return }
+        do {
+            try device.lockForConfiguration()
+            device.activeFormat = format
+            if device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposureMode = .continuousAutoExposure
+            }
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            }
+            device.unlockForConfiguration()
+        } catch {}
+    }
+
+    /// Enable rotation, mirroring (front), and the strongest available stabilization on a connection.
+    private func configureVideoConnection(_ connection: AVCaptureConnection, isFront: Bool) {
+        if #available(iOS 17.0, *) {
+            if connection.isVideoRotationAngleSupported(90) { connection.videoRotationAngle = 90 }
+        } else {
+            if connection.isVideoOrientationSupported { connection.videoOrientation = .portrait }
+        }
+        if connection.isVideoStabilizationSupported {
+            connection.preferredVideoStabilizationMode = .auto
+        }
+        if connection.isVideoMirroringSupported {
+            connection.automaticallyAdjustsVideoMirroring = false
+            connection.isVideoMirrored = isFront
+        }
+    }
+
     private func setupCamera() {
         let session = AVCaptureSession()
-        session.sessionPreset = .photo
+        // .inputPriority lets us drive activeFormat directly so we always pick the device's best format
+        // (highest still + highest video) instead of being capped by a generic preset.
+        session.sessionPreset = .inputPriority
 
-        // All input/output additions must live between begin/commit so the session never
-        // observes a partially configured state. Without this, real devices intermittently wedge.
         session.beginConfiguration()
         defer { session.commitConfiguration() }
 
-        guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
-            return
-        }
+        guard let camera = bestCamera(position: .back) else { return }
 
         do {
-            // Add the input first; configure device properties after, since some properties
-            // (active frame durations) only validate against an attached, running format.
             let input = try AVCaptureDeviceInput(device: camera)
             if session.canAddInput(input) { session.addInput(input) }
-
-            try camera.lockForConfiguration()
-            if camera.isExposureModeSupported(.continuousAutoExposure) {
-                camera.exposureMode = .continuousAutoExposure
-            }
-            if camera.isFocusModeSupported(.continuousAutoFocus) {
-                camera.focusMode = .continuousAutoFocus
-            }
-            // Don't pin frame duration — that can force a lower-res activeFormat that limits photo dims.
-            // Let the .photo session preset pick the highest-quality format the device supports.
-            camera.unlockForConfiguration()
         } catch {
             return
         }
+        applyBestFormat(camera)
 
         let output = AVCaptureVideoDataOutput()
+        // No size keys — deliver native frames at the format's video resolution (up to 4K on supported devices).
         output.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey as String: 1920,
-            kCVPixelBufferHeightKey as String: 1080
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ]
         output.alwaysDiscardsLateVideoFrames = true
         output.setSampleBufferDelegate(self, queue: renderQueue)
@@ -385,15 +442,7 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
         if session.canAddOutput(output) { session.addOutput(output) }
 
         if let connection = output.connection(with: .video) {
-            if #available(iOS 17.0, *) {
-                if connection.isVideoRotationAngleSupported(90) {
-                    connection.videoRotationAngle = 90
-                }
-            } else {
-                if connection.isVideoOrientationSupported {
-                    connection.videoOrientation = .portrait
-                }
-            }
+            configureVideoConnection(connection, isFront: false)
         }
 
         videoOutput = output
@@ -577,7 +626,7 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
         guard let session = captureSession else { return }
 
         let newPosition: AVCaptureDevice.Position = (currentCameraPosition == .back) ? .front : .back
-        guard let newCamera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: newPosition) else { return }
+        guard let newCamera = bestCamera(position: newPosition) else { return }
 
         session.beginConfiguration()
 
@@ -592,24 +641,14 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
             let newInput = try AVCaptureDeviceInput(device: newCamera)
             guard session.canAddInput(newInput) else { session.commitConfiguration(); return }
             session.addInput(newInput)
-
-            try newCamera.lockForConfiguration()
-            if newCamera.isExposureModeSupported(.continuousAutoExposure) { newCamera.exposureMode = .continuousAutoExposure }
-            if newCamera.isFocusModeSupported(.continuousAutoFocus) { newCamera.focusMode = .continuousAutoFocus }
-            // No frame-duration lock — keep the preset's highest-resolution format.
-            newCamera.unlockForConfiguration()
         } catch {
             session.commitConfiguration()
             return
         }
+        applyBestFormat(newCamera)
 
         if let connection = videoOutput?.connection(with: .video) {
-            if #available(iOS 17.0, *) {
-                if connection.isVideoRotationAngleSupported(90) { connection.videoRotationAngle = 90 }
-            } else {
-                if connection.isVideoOrientationSupported { connection.videoOrientation = .portrait }
-            }
-            connection.isVideoMirrored = (newPosition == .front)
+            configureVideoConnection(connection, isFront: newPosition == .front)
         }
 
         if let photoConnection = photoOutput?.connection(with: .video) {
@@ -618,8 +657,8 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
             } else {
                 if photoConnection.isVideoOrientationSupported { photoConnection.videoOrientation = .portrait }
             }
-            // Disable hardware mirror on photo connection — iOS's behavior here is inconsistent across
-            // versions (sometimes only EXIF flag, sometimes pixels). We mirror in CIImage instead.
+            // Photo connection mirror stays off — we apply the front-camera mirror in CIImage so behavior
+            // is deterministic across iOS versions.
             if photoConnection.isVideoMirroringSupported {
                 photoConnection.automaticallyAdjustsVideoMirroring = false
                 photoConnection.isVideoMirrored = false
@@ -682,35 +721,26 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
         }
     }
 
-    private func setQualityInternal(_ quality: String) {
-        guard let session = captureSession else { return }
-        session.beginConfiguration()
-        switch quality {
-        case "SD":
-            if session.canSetSessionPreset(.vga640x480) { session.sessionPreset = .vga640x480 }
-        case "HD":
-            if session.canSetSessionPreset(.hd1280x720) { session.sessionPreset = .hd1280x720 }
-        case "FHD":
-            if session.canSetSessionPreset(.hd1920x1080) { session.sessionPreset = .hd1920x1080 }
-        case "4K":
-            if session.canSetSessionPreset(.hd4K3840x2160) { session.sessionPreset = .hd4K3840x2160 }
-        default:
-            if session.canSetSessionPreset(.hd1280x720) { session.sessionPreset = .hd1280x720 }
-        }
-        session.commitConfiguration()
-    }
-
     private func videoSettingsForCurrentPreset() -> (Int, Int, Int) {
-        // Bitrates tuned for HEVC at Apple-Camera-app quality. HEVC is ~30-40% more efficient than H.264
-        // so these are noticeably higher than the old H.264 values without ballooning file size.
-        guard let preset = captureSession?.sessionPreset else { return (1280, 720, 10_000_000) }
-        switch preset {
-        case .vga640x480:    return (480,  640,  3_000_000)
-        case .hd1280x720:    return (720,  1280, 10_000_000)
-        case .hd1920x1080:   return (1080, 1920, 22_000_000)
-        case .hd4K3840x2160: return (2160, 3840, 60_000_000)
-        default:             return (1080, 1920, 22_000_000)
+        // Read native dimensions from the device's active format — we use .inputPriority to drive
+        // the format directly, so this returns whatever the device's best format actually is (up to 4K).
+        let device = captureSession?.inputs
+            .compactMap { ($0 as? AVCaptureDeviceInput)?.device }
+            .first(where: { $0.hasMediaType(.video) })
+        let dim = device.map { CMVideoFormatDescriptionGetDimensions($0.activeFormat.formatDescription) }
+            ?? CMVideoDimensions(width: 1920, height: 1080)
+
+        let w = Int(dim.width), h = Int(dim.height)
+        let pixels = w * h
+        // HEVC bitrates calibrated to Apple Camera output at each native resolution.
+        let bitrate: Int
+        switch pixels {
+        case let p where p >= 3840 * 2160:  bitrate = 60_000_000   // 4K
+        case let p where p >= 1920 * 1080:  bitrate = 22_000_000   // FHD
+        case let p where p >= 1280 * 720:   bitrate = 10_000_000   // HD
+        default:                            bitrate = 5_000_000    // SD or smaller
         }
+        return (h, w, bitrate)
     }
 
     private func setZoomInternal(_ zoomFactor: CGFloat) {
