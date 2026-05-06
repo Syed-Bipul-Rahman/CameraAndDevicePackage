@@ -6,7 +6,7 @@ import UIKit
 /// Flow:
 ///   Splash (3s) → Welcome (video + auto-advance 6s) → GetStarted (video + button)
 ///   → Find Device → Connecting → Home
-///   Home: Camera | Light Control | Gallery
+///   Home: Camera | Light Control | Tutorial
 ///
 /// Returning users skip the welcome / get-started screens but must still pair a device.
 public final class AppCoordinator {
@@ -116,11 +116,11 @@ public final class AppCoordinator {
         let lightBtn = makeGlassButton(icon: "lightbulb", label: "Super Nova") { [weak self] in
             self?.showLightControl()
         }
-        let galleryBtn = makeGlassButton(icon: "play.circle", label: "Gallery") { [weak self] in
-            self?.showGallery()
+        let tutorialBtn = makeGlassButton(icon: "book.closed", label: "Tutorial") { [weak self] in
+            self?.showTutorial()
         }
 
-        [cameraBtn, lightBtn, galleryBtn].forEach { stack.addArrangedSubview($0) }
+        [cameraBtn, lightBtn, tutorialBtn].forEach { stack.addArrangedSubview($0) }
         return stack
     }
 
@@ -181,12 +181,12 @@ public final class AppCoordinator {
         navigationController.pushViewController(vc, animated: true)
     }
 
-    private func showGallery() {
-        let vc = PhotoGalleryViewController()
-        let nav = UINavigationController(rootViewController: vc)
-        nav.modalPresentationStyle = .fullScreen
-        nav.navigationBar.tintColor = .white
-        nav.navigationBar.barStyle = .black
-        navigationController.present(nav, animated: true)
+    private func showTutorial() {
+        navigationController.setNavigationBarHidden(false, animated: false)
+        let vc = TutorialViewController()
+        vc.onBack = { [weak self] in self?.navigationController.popViewController(animated: true) }
+        vc.onCameraTap = { [weak self] in self?.showCamera() }
+        vc.onLightTap = { [weak self] in self?.showLightControl() }
+        navigationController.pushViewController(vc, animated: true)
     }
 }

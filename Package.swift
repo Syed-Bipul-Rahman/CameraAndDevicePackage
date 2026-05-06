@@ -12,7 +12,10 @@ let package = Package(
     targets: [
         .target(
             name: "Supernova",
-            path: "Sources/Supernova"
+            path: "Sources/Supernova",
+            resources: [
+                .process("Resources")
+            ]
         )
     ]
 )

@@ -57,6 +57,12 @@ public final class OnboardingVideoViewController: UIViewController {
         playerLayer?.frame = view.bounds
     }
 
+    public override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        // Resume playback when returning to this screen (e.g. popping back from Camera/Light/Tutorial).
+        player?.play()
+    }
+
     public override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         player?.pause()
@@ -98,6 +104,8 @@ public final class OnboardingVideoViewController: UIViewController {
 
     private func setupButton() {
         guard let cfg = config else { return }
+        // Home / post-pairing screens pass an empty title — don't render a CTA in that case.
+        guard !cfg.buttonTitle.isEmpty else { return }
 
         let btn = UIButton(type: .system)
         var titleText = cfg.buttonTitle + "  "

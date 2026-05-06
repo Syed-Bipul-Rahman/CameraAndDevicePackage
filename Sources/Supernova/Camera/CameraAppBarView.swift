@@ -209,11 +209,12 @@ final class ExpandableOptionButton: UIView {
             circleContent.centerYAnchor.constraint(equalTo: selectedCircle.centerYAnchor),
         ])
 
-        // Options stack
+        // Options stack — hidden (not just alpha=0) so UIStackView excludes it from layout while collapsed.
         optionsStack.axis = .horizontal
         optionsStack.alignment = .center
         optionsStack.spacing = 10
         optionsStack.alpha = 0
+        optionsStack.isHidden = true
         optionsStack.translatesAutoresizingMaskIntoConstraints = false
 
         let row = UIStackView(arrangedSubviews: [selectedCircle, optionsStack, UIView()])
@@ -281,6 +282,8 @@ final class ExpandableOptionButton: UIView {
         selectedCircle.backgroundColor = iconImage != nil ? UIColor(white: 0.55, alpha: 1) : .white
         if iconImage == nil { selectedLabel.textColor = UIColor(red: 0.2, green: 0.2, blue: 0.2, alpha: 1) }
 
+        // Bring the stack into layout before animating width so the labels can fit during the expand.
+        optionsStack.isHidden = false
         UIView.animate(withDuration: 0.2, delay: 0, options: .curveEaseOut) {
             self.widthConstraint.constant = self.expandedWidth
             self.layoutIfNeeded()
@@ -294,11 +297,14 @@ final class ExpandableOptionButton: UIView {
         selectedCircle.backgroundColor = .clear
         selectedLabel.textColor = .black
 
-        UIView.animate(withDuration: 0.2) {
+        UIView.animate(withDuration: 0.2, animations: {
             self.optionsStack.alpha = 0
             self.widthConstraint.constant = self.collapsedWidth
             self.layoutIfNeeded()
-        }
+        }, completion: { _ in
+            // Take the stack out of layout once collapsed so it can't fight the 32pt width constraint.
+            self.optionsStack.isHidden = true
+        })
     }
 
     @objc private func handleTap() {
