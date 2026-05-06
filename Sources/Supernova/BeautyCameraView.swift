@@ -701,13 +701,15 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
     }
 
     private func videoSettingsForCurrentPreset() -> (Int, Int, Int) {
-        guard let preset = captureSession?.sessionPreset else { return (1280, 720, 6_000_000) }
+        // Bitrates tuned for HEVC at Apple-Camera-app quality. HEVC is ~30-40% more efficient than H.264
+        // so these are noticeably higher than the old H.264 values without ballooning file size.
+        guard let preset = captureSession?.sessionPreset else { return (1280, 720, 10_000_000) }
         switch preset {
-        case .vga640x480: return (480, 640, 2_000_000)
-        case .hd1280x720: return (720, 1280, 6_000_000)
-        case .hd1920x1080: return (1080, 1920, 12_000_000)
-        case .hd4K3840x2160: return (2160, 3840, 40_000_000)
-        default: return (1080, 1920, 12_000_000)
+        case .vga640x480:    return (480,  640,  3_000_000)
+        case .hd1280x720:    return (720,  1280, 10_000_000)
+        case .hd1920x1080:   return (1080, 1920, 22_000_000)
+        case .hd4K3840x2160: return (2160, 3840, 60_000_000)
+        default:             return (1080, 1920, 22_000_000)
         }
     }
 
@@ -952,13 +954,17 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
         let videoWidth = max(outW, 2)
         let videoHeight = max(outH, 2)
 
+        // HEVC is the same codec the system Camera app uses on every iPhone since the 7. Hardware-accelerated
+        // and produces visibly cleaner motion / less blocking than H.264 at the bitrates we're targeting.
         let videoSettings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: videoWidth,
             AVVideoHeightKey: videoHeight,
             AVVideoCompressionPropertiesKey: [
                 AVVideoAverageBitRateKey: videoBitrate,
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
+                // ~1 keyframe / second at 30 fps so seeking stays responsive without hurting compression.
+                AVVideoMaxKeyFrameIntervalKey: 30,
+                AVVideoExpectedSourceFrameRateKey: 30
             ]
         ]
         videoWriterInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
