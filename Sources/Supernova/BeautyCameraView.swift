@@ -22,6 +22,9 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
     private let sessionQueue = DispatchQueue(label: "com.supernova.camera.session")
     private let renderQueue = DispatchQueue(label: "com.supernova.camera.render")
     private let audioQueue = DispatchQueue(label: "com.supernova.camera.audio")
+    // Dedicated queue for photo decode / filter / encode / save so heavy capture work doesn't sit on
+    // the session queue (which would block startRunning/setFocus/etc) or the render queue (live frames).
+    private let photoProcessingQueue = DispatchQueue(label: "com.supernova.camera.photo", qos: .userInitiated)
 
     private var metalDevice: MTLDevice?
     private var commandQueue: MTLCommandQueue?
@@ -189,6 +192,24 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
         return b.width / b.height
     }
 
+    /// Post-capture polish — denoise + subtle luminance sharpen for the "pop" look. Cheap relative to
+    /// the encode itself, runs on photoProcessingQueue so the live preview is unaffected.
+    private func applyPhotoEnhancements(_ image: CIImage) -> CIImage {
+        var img = image
+        if let nr = CIFilter(name: "CINoiseReduction") {
+            nr.setValue(img, forKey: kCIInputImageKey)
+            nr.setValue(0.02, forKey: "inputNoiseLevel")
+            nr.setValue(0.40, forKey: "inputSharpness")
+            if let out = nr.outputImage?.cropped(to: img.extent) { img = out }
+        }
+        if let sh = CIFilter(name: "CISharpenLuminance") {
+            sh.setValue(img, forKey: kCIInputImageKey)
+            sh.setValue(0.40, forKey: kCIInputSharpnessKey)
+            if let out = sh.outputImage?.cropped(to: img.extent) { img = out }
+        }
+        return img
+    }
+
     /// Mirror an image horizontally — used for front-camera selfies so the saved photo matches
     /// the mirrored live preview (which is mirrored at the videoOutput connection level).
     private func mirrorHorizontally(_ image: CIImage) -> CIImage {
@@ -345,8 +366,8 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
             if camera.isFocusModeSupported(.continuousAutoFocus) {
                 camera.focusMode = .continuousAutoFocus
             }
-            camera.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
-            camera.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+            // Don't pin frame duration — that can force a lower-res activeFormat that limits photo dims.
+            // Let the .photo session preset pick the highest-quality format the device supports.
             camera.unlockForConfiguration()
         } catch {
             return
@@ -575,8 +596,7 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
             try newCamera.lockForConfiguration()
             if newCamera.isExposureModeSupported(.continuousAutoExposure) { newCamera.exposureMode = .continuousAutoExposure }
             if newCamera.isFocusModeSupported(.continuousAutoFocus) { newCamera.focusMode = .continuousAutoFocus }
-            newCamera.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
-            newCamera.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+            // No frame-duration lock — keep the preset's highest-resolution format.
             newCamera.unlockForConfiguration()
         } catch {
             session.commitConfiguration()
@@ -819,7 +839,9 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
                     settings.maxPhotoDimensions = deviceMaxDim
                 }
             }
-            settings.photoQualityPrioritization = .speed
+            // .quality enables Smart HDR / Deep Fusion / Photonic Engine. The front sensor depends on
+            // these passes — without them, photos look flat and noisy.
+            settings.photoQualityPrioritization = .quality
         } else {
             settings.isHighResolutionPhotoEnabled = true
         }
@@ -860,7 +882,7 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
         guard let photosDir = makePhotosDir() else { return nil }
         let fileURL = photosDir.appendingPathComponent("photo_\(Int(Date().timeIntervalSince1970 * 1000)).heic")
         guard let destination = CGImageDestinationCreateWithURL(fileURL as CFURL, "public.heic" as CFString, 1, nil) else { return nil }
-        CGImageDestinationAddImage(destination, cgImage, [kCGImageDestinationLossyCompressionQuality: 0.95] as CFDictionary)
+        CGImageDestinationAddImage(destination, cgImage, [kCGImageDestinationLossyCompressionQuality: 1.0] as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { return nil }
         return fileURL
     }
@@ -1290,11 +1312,12 @@ extension BeautyCameraView: AVCapturePhotoCaptureDelegate {
         pendingPreviewAspect = 0
         let isFront = (currentCameraPosition == .front)
 
-        sessionQueue.async { [weak self] in
+        // Run on a dedicated queue (not sessionQueue) so the camera session stays responsive —
+        // the next shot, focus tap, zoom, or torch toggle isn't queued behind a heavy decode/encode.
+        photoProcessingQueue.async { [weak self] in
             guard let self = self else { return }
 
-            // Decode → optionally filter → mirror (front only) → crop to preview aspect → encode.
-            // This guarantees the saved image is the exact rectangle the user saw in live preview.
+            // Decode → optionally filter → enhance (denoise + sharpen) → mirror (front only) → crop → encode.
             guard let ciImage = CIImage(data: imageData, options: [.applyOrientationProperty: true]) else {
                 DispatchQueue.main.async { completion(.failure(BeautyCameraError.captureError("Failed to decode captured photo"))) }
                 return
@@ -1309,8 +1332,10 @@ extension BeautyCameraView: AVCapturePhotoCaptureDelegate {
             if isFront { output = self.mirrorHorizontally(output) }
             output = self.cropToPreviewAspect(output, previewAspect: previewAspect)
 
+            // Render at 16-bit float so we don't clip the sensor's bit depth on the way out.
+            // Wide-gamut HEIC + quality 1.0 keeps the saved photo as close as possible to the source.
             let p3 = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
-            guard let cgImage = self.ciContext?.createCGImage(output, from: output.extent, format: .RGBA8, colorSpace: p3) else {
+            guard let cgImage = self.ciContext?.createCGImage(output, from: output.extent, format: .RGBAh, colorSpace: p3) else {
                 DispatchQueue.main.async { completion(.failure(BeautyCameraError.captureError("Failed to render captured photo"))) }
                 return
             }

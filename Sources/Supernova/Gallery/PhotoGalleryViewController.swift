@@ -117,8 +117,7 @@ extension PhotoGalleryViewController: UICollectionViewDataSource, UICollectionVi
     }
 
     public func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
-        let asset = assets[indexPath.item]
-        let viewer = PhotoViewerViewController(asset: asset)
+        let viewer = PhotoViewerPageController(assets: assets, startIndex: indexPath.item)
         viewer.modalPresentationStyle = .fullScreen
         present(viewer, animated: true)
     }
@@ -168,16 +167,20 @@ private final class PhotoThumbnailCell: UICollectionViewCell {
     }
 }
 
-// MARK: - PhotoViewerViewController
+// MARK: - PhotoViewerPageController (paging + zoom)
 
-private final class PhotoViewerViewController: UIViewController {
-    private let asset: PHAsset
-    private let imageView = UIImageView()
+/// Full-screen viewer that pages between assets horizontally and supports pinch / double-tap zoom on each.
+private final class PhotoViewerPageController: UIPageViewController, UIPageViewControllerDataSource {
+    private let assets: PHFetchResult<PHAsset>
     private let closeBtn = UIButton(type: .system)
 
-    init(asset: PHAsset) {
-        self.asset = asset
-        super.init(nibName: nil, bundle: nil)
+    init(assets: PHFetchResult<PHAsset>, startIndex: Int) {
+        self.assets = assets
+        super.init(transitionStyle: .scroll, navigationOrientation: .horizontal,
+                   options: [.interPageSpacing: 16])
+        let initial = ZoomablePhotoViewController(asset: assets[startIndex], index: startIndex)
+        setViewControllers([initial], direction: .forward, animated: false)
+        dataSource = self
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -185,9 +188,6 @@ private final class PhotoViewerViewController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
-        imageView.contentMode = .scaleAspectFit
-        imageView.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(imageView)
 
         closeBtn.setImage(UIImage(systemName: "xmark.circle.fill"), for: .normal)
         closeBtn.tintColor = .white
@@ -196,22 +196,127 @@ private final class PhotoViewerViewController: UIViewController {
         view.addSubview(closeBtn)
 
         NSLayoutConstraint.activate([
-            imageView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            imageView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            imageView.topAnchor.constraint(equalTo: view.topAnchor),
-            imageView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             closeBtn.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
             closeBtn.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
             closeBtn.widthAnchor.constraint(equalToConstant: 36),
             closeBtn.heightAnchor.constraint(equalToConstant: 36),
         ])
+    }
 
-        let opts = PHImageRequestOptions(); opts.isNetworkAccessAllowed = true; opts.deliveryMode = .highQualityFormat
-        PHImageManager.default().requestImage(for: asset, targetSize: PHImageManagerMaximumSize,
-                                              contentMode: .aspectFit, options: opts) { [weak self] image, _ in
+    @objc private func close() { dismiss(animated: true) }
+
+    func pageViewController(_ pageViewController: UIPageViewController,
+                            viewControllerBefore viewController: UIViewController) -> UIViewController? {
+        guard let current = viewController as? ZoomablePhotoViewController else { return nil }
+        let prev = current.index - 1
+        guard prev >= 0 else { return nil }
+        return ZoomablePhotoViewController(asset: assets[prev], index: prev)
+    }
+
+    func pageViewController(_ pageViewController: UIPageViewController,
+                            viewControllerAfter viewController: UIViewController) -> UIViewController? {
+        guard let current = viewController as? ZoomablePhotoViewController else { return nil }
+        let next = current.index + 1
+        guard next < assets.count else { return nil }
+        return ZoomablePhotoViewController(asset: assets[next], index: next)
+    }
+}
+
+// MARK: - ZoomablePhotoViewController (one page, with pinch + double-tap zoom)
+
+private final class ZoomablePhotoViewController: UIViewController, UIScrollViewDelegate {
+    let asset: PHAsset
+    let index: Int
+
+    private let scrollView = UIScrollView()
+    private let imageView = UIImageView()
+    private var requestID: PHImageRequestID?
+
+    init(asset: PHAsset, index: Int) {
+        self.asset = asset
+        self.index = index
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+
+        scrollView.delegate = self
+        scrollView.minimumZoomScale = 1.0
+        scrollView.maximumZoomScale = 4.0
+        scrollView.bouncesZoom = true
+        scrollView.showsHorizontalScrollIndicator = false
+        scrollView.showsVerticalScrollIndicator = false
+        scrollView.contentInsetAdjustmentBehavior = .never
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(scrollView)
+
+        imageView.contentMode = .scaleAspectFit
+        imageView.isUserInteractionEnabled = true
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.addSubview(imageView)
+
+        NSLayoutConstraint.activate([
+            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: view.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+
+            imageView.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
+            imageView.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
+            imageView.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
+            imageView.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
+            imageView.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor),
+            imageView.heightAnchor.constraint(equalTo: scrollView.frameLayoutGuide.heightAnchor),
+        ])
+
+        let doubleTap = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap(_:)))
+        doubleTap.numberOfTapsRequired = 2
+        scrollView.addGestureRecognizer(doubleTap)
+
+        loadFullImage()
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        // Reset zoom when paging away so the next visit starts un-zoomed.
+        scrollView.setZoomScale(1.0, animated: false)
+    }
+
+    deinit {
+        if let rid = requestID { PHImageManager.default().cancelImageRequest(rid) }
+    }
+
+    private func loadFullImage() {
+        let opts = PHImageRequestOptions()
+        opts.isNetworkAccessAllowed = true
+        opts.deliveryMode = .highQualityFormat
+        opts.resizeMode = .exact
+        requestID = PHImageManager.default().requestImage(
+            for: asset, targetSize: PHImageManagerMaximumSize,
+            contentMode: .aspectFit, options: opts
+        ) { [weak self] image, _ in
             self?.imageView.image = image
         }
     }
 
-    @objc private func close() { dismiss(animated: true) }
+    @objc private func handleDoubleTap(_ gr: UITapGestureRecognizer) {
+        if scrollView.zoomScale > scrollView.minimumZoomScale + 0.01 {
+            scrollView.setZoomScale(scrollView.minimumZoomScale, animated: true)
+        } else {
+            let pt = gr.location(in: imageView)
+            let target: CGFloat = 2.5
+            let w = scrollView.bounds.width / target
+            let h = scrollView.bounds.height / target
+            let rect = CGRect(x: pt.x - w / 2, y: pt.y - h / 2, width: w, height: h)
+            scrollView.zoom(to: rect, animated: true)
+        }
+    }
+
+    // MARK: - UIScrollViewDelegate
+
+    func viewForZooming(in scrollView: UIScrollView) -> UIView? { imageView }
 }
