@@ -13,6 +13,16 @@ struct DetectedFace {
     let noseRegion: CGRect?
     let mouthRegion: CGRect?
 
+    // Full landmark polygons in image-normalized Y-down coordinates. Used to build a precise skin mask
+    // (face contour minus eyes/lips/brows/nostrils) instead of the bounding-box ellipse.
+    let faceContour: [CGPoint]?
+    let leftEye: [CGPoint]?
+    let rightEye: [CGPoint]?
+    let outerLips: [CGPoint]?
+    let leftEyebrow: [CGPoint]?
+    let rightEyebrow: [CGPoint]?
+    let nose: [CGPoint]?
+
     func expandedBoundingBox(by percentage: CGFloat) -> CGRect {
         let expandX = boundingBox.width * percentage
         let expandY = boundingBox.height * percentage
@@ -28,11 +38,14 @@ struct DetectedFace {
 class FaceDetectionService {
     private var lastDetectedFaces: [DetectedFace] = []
     private var frameCount: Int = 0
-    // Run detection every 15 frames (~2x/sec at 30fps)
-    private let detectionInterval: Int = 15
+    // Run detection every 5 frames (~6x/sec at 30fps). On A14+ this is comfortable and gives the skin
+    // mask enough updates per second to track head movement without visible lag.
+    private let detectionInterval: Int = 5
     private var isDetecting: Bool = false
-    private let detectionQueue = DispatchQueue(label: "com.supernova.facedetection", qos: .utility)
-    private let smoothingFactor: CGFloat = 0.7
+    private let detectionQueue = DispatchQueue(label: "com.supernova.facedetection", qos: .userInitiated)
+    // Lower than the original 0.7: less lag, mask catches up to the face within ~3 detection cycles.
+    // The motion-fade in BeautyFilterProcessor handles any residual lag by hiding the effect when moving.
+    private let smoothingFactor: CGFloat = 0.4
 
     private let ciContext: CIContext = {
         if let device = MTLCreateSystemDefaultDevice() {
@@ -125,20 +138,41 @@ class FaceDetectionService {
 
                 // Extract landmark screen positions for face-detection overlays
                 var landmarks: [String: CGPoint] = [:]
+                var contourPoints: [CGPoint]?
+                var leftEyePoints: [CGPoint]?
+                var rightEyePoints: [CGPoint]?
+                var outerLipPoints: [CGPoint]?
+                var leftBrowPoints: [CGPoint]?
+                var rightBrowPoints: [CGPoint]?
+                var nosePoints: [CGPoint]?
+
                 if let faceLandmarks = observation.landmarks {
                     if let leftEyeLM = faceLandmarks.leftEye {
                         landmarks["leftEye"] = self.landmarkCenter(leftEyeLM, in: visionBox, isRotated: isRotated)
+                        leftEyePoints = self.landmarkPoints(leftEyeLM, in: visionBox, isRotated: isRotated)
                     }
                     if let rightEyeLM = faceLandmarks.rightEye {
                         landmarks["rightEye"] = self.landmarkCenter(rightEyeLM, in: visionBox, isRotated: isRotated)
+                        rightEyePoints = self.landmarkPoints(rightEyeLM, in: visionBox, isRotated: isRotated)
                     }
                     if let noseLM = faceLandmarks.nose {
                         landmarks["noseBase"] = self.landmarkCenter(noseLM, in: visionBox, isRotated: isRotated)
+                        nosePoints = self.landmarkPoints(noseLM, in: visionBox, isRotated: isRotated)
                     }
                     if let mouthLM = faceLandmarks.outerLips {
                         landmarks["mouthLeft"]   = self.landmarkCenter(mouthLM, in: visionBox, isRotated: isRotated)
                         landmarks["mouthRight"]  = self.landmarkCenter(mouthLM, in: visionBox, isRotated: isRotated)
                         landmarks["mouthBottom"] = self.landmarkCenter(mouthLM, in: visionBox, isRotated: isRotated)
+                        outerLipPoints = self.landmarkPoints(mouthLM, in: visionBox, isRotated: isRotated)
+                    }
+                    if let contourLM = faceLandmarks.faceContour {
+                        contourPoints = self.landmarkPoints(contourLM, in: visionBox, isRotated: isRotated)
+                    }
+                    if let lbLM = faceLandmarks.leftEyebrow {
+                        leftBrowPoints = self.landmarkPoints(lbLM, in: visionBox, isRotated: isRotated)
+                    }
+                    if let rbLM = faceLandmarks.rightEyebrow {
+                        rightBrowPoints = self.landmarkPoints(rbLM, in: visionBox, isRotated: isRotated)
                     }
                 }
 
@@ -149,7 +183,14 @@ class FaceDetectionService {
                     leftEyeRegion: leftEye,
                     rightEyeRegion: rightEye,
                     noseRegion: nose,
-                    mouthRegion: mouth
+                    mouthRegion: mouth,
+                    faceContour: contourPoints,
+                    leftEye: leftEyePoints,
+                    rightEye: rightEyePoints,
+                    outerLips: outerLipPoints,
+                    leftEyebrow: leftBrowPoints,
+                    rightEyebrow: rightBrowPoints,
+                    nose: nosePoints
                 ))
             }
 
@@ -175,19 +216,28 @@ class FaceDetectionService {
     }
 
     /// Convert a Vision landmark's center from face-relative normalized coords to image-normalized Y-down coords.
+    /// Vision uses Y-up everywhere — both the bounding box AND the per-feature normalized points. Convert to
+    /// image-Y-up first, then flip once to screen-Y-down.
     private func landmarkCenter(_ landmark: VNFaceLandmarkRegion2D, in faceBox: CGRect, isRotated: Bool) -> CGPoint {
         guard !landmark.normalizedPoints.isEmpty else { return .zero }
-        // Landmark points are in face-bounding-box space, Y-up
         let avg = landmark.normalizedPoints.reduce(.zero) { CGPoint(x: $0.x + $1.x, y: $0.y + $1.y) }
         let n = CGFloat(landmark.normalizedPoints.count)
-        let lx = faceBox.origin.x + (avg.x / n) * faceBox.width
-        let ly = faceBox.origin.y + (1.0 - avg.y / n) * faceBox.height  // Vision Y-up within face box
-        // Convert from Vision image Y-up to screen Y-down
-        var pt = CGPoint(x: lx, y: 1.0 - ly)
-        if isRotated {
-            pt = CGPoint(x: pt.y, y: 1.0 - pt.x)
-        }
+        let visionX = faceBox.origin.x + (avg.x / n) * faceBox.width
+        let visionY = faceBox.origin.y + (avg.y / n) * faceBox.height  // image Y-up
+        var pt = CGPoint(x: visionX, y: 1.0 - visionY)                  // → screen Y-down
+        if isRotated { pt = CGPoint(x: pt.y, y: 1.0 - pt.x) }
         return pt
+    }
+
+    /// Convert all of a Vision landmark's points to image-normalized Y-down coordinates (matching face.boundingBox).
+    private func landmarkPoints(_ landmark: VNFaceLandmarkRegion2D, in faceBox: CGRect, isRotated: Bool) -> [CGPoint] {
+        landmark.normalizedPoints.map { p in
+            let visionX = faceBox.origin.x + p.x * faceBox.width
+            let visionY = faceBox.origin.y + p.y * faceBox.height       // image Y-up
+            var pt = CGPoint(x: visionX, y: 1.0 - visionY)               // → screen Y-down
+            if isRotated { pt = CGPoint(x: pt.y, y: 1.0 - pt.x) }
+            return pt
+        }
     }
 
     // MARK: - Smoothing (identical to original)
@@ -210,8 +260,26 @@ class FaceDetectionService {
                 leftEyeRegion: smoothRect(matching.leftEyeRegion, newFace.leftEyeRegion),
                 rightEyeRegion: smoothRect(matching.rightEyeRegion, newFace.rightEyeRegion),
                 noseRegion: smoothRect(matching.noseRegion, newFace.noseRegion),
-                mouthRegion: smoothRect(matching.mouthRegion, newFace.mouthRegion)
+                mouthRegion: smoothRect(matching.mouthRegion, newFace.mouthRegion),
+                faceContour: smoothPoints(matching.faceContour, newFace.faceContour),
+                leftEye:     smoothPoints(matching.leftEye,     newFace.leftEye),
+                rightEye:    smoothPoints(matching.rightEye,    newFace.rightEye),
+                outerLips:   smoothPoints(matching.outerLips,   newFace.outerLips),
+                leftEyebrow: smoothPoints(matching.leftEyebrow, newFace.leftEyebrow),
+                rightEyebrow:smoothPoints(matching.rightEyebrow,newFace.rightEyebrow),
+                nose:        smoothPoints(matching.nose,        newFace.nose)
             )
+        }
+    }
+
+    /// Per-point exponential smoothing to remove jitter between detection cycles. Falls back to the
+    /// new polygon when the count changes (Vision occasionally returns a different number of points).
+    private func smoothPoints(_ old: [CGPoint]?, _ new: [CGPoint]?) -> [CGPoint]? {
+        guard let new = new else { return nil }
+        guard let old = old, old.count == new.count else { return new }
+        let f = smoothingFactor
+        return zip(old, new).map { o, n in
+            CGPoint(x: o.x * f + n.x * (1 - f), y: o.y * f + n.y * (1 - f))
         }
     }
 

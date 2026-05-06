@@ -35,7 +35,48 @@ class BeautyFilterProcessor {
     var backgroundBlurEnabled: Bool = false
     var backgroundBlurIntensity: Float = 0.0
 
-    var detectedFaces: [DetectedFace] = []
+    var detectedFaces: [DetectedFace] = [] {
+        didSet { updateMotionFade(previous: oldValue, current: detectedFaces) }
+    }
+
+    // Motion-aware fade: pro apps hide the effect while the face is moving and bring it back once it
+    // settles, because a rendered mask always lags reality by some milliseconds. Matching that here.
+    private var motionFade: Float = 1.0
+    private var lastFaceCenter: CGPoint?
+    private var lastFaceWidth: CGFloat = 0
+
+    private func updateMotionFade(previous: [DetectedFace], current: [DetectedFace]) {
+        guard let face = current.first else {
+            motionFade = 0
+            lastFaceCenter = nil
+            lastFaceWidth = 0
+            return
+        }
+        let center = CGPoint(x: face.boundingBox.midX, y: face.boundingBox.midY)
+        let faceWidth = face.boundingBox.width
+        if let last = lastFaceCenter, lastFaceWidth > 0 {
+            // Distance moved as a fraction of face width — scale-independent.
+            let dx = center.x - last.x
+            let dy = center.y - last.y
+            let distance = sqrt(dx * dx + dy * dy)
+            let normalized = Float(distance / max(0.05, faceWidth))
+            // > 8% of face width per detection cycle = clear movement → drop fade fast.
+            // Less than 3% = essentially still → ramp fade up smoothly.
+            if normalized > 0.08 {
+                motionFade = max(0, motionFade - 0.6)
+            } else if normalized < 0.03 {
+                motionFade = min(1.0, motionFade + 0.18)
+            } else {
+                // Mid range: hold steady, slow ramp.
+                motionFade = min(1.0, motionFade + 0.06)
+            }
+        } else {
+            // First face we've seen — start at 0 and fade in so it eases on screen.
+            motionFade = max(motionFade, 0.2)
+        }
+        lastFaceCenter = center
+        lastFaceWidth = faceWidth
+    }
 
     private var skinSmoothingProcessor: SkinSmoothingProcessor?
 
@@ -131,7 +172,9 @@ class BeautyFilterProcessor {
 
     private func applyMilkySkin(to image: CIImage) -> CIImage {
         let imageExtent = image.extent
-        let intensity = Double(milkySkinIntensity) * 0.5
+        // motionFade hides the effect during head movement so users don't see the mask lag behind the face.
+        let intensity = Double(milkySkinIntensity) * 0.5 * Double(motionFade)
+        if intensity < 0.001 { return image }
 
         let downscale: CGFloat = 0.5
         let downTransform = CGAffineTransform(scaleX: downscale, y: downscale)
@@ -176,6 +219,11 @@ class BeautyFilterProcessor {
     }
 
     private func createMilkyFaceMask(for faces: [DetectedFace], imageExtent: CGRect) -> CIImage {
+        // Use the precise Vision-landmark skin polygon when available; falls back to the elliptical
+        // bounding-box approximation only if landmarks are missing for a face.
+        if faces.contains(where: { $0.faceContour != nil && !($0.faceContour?.isEmpty ?? true) }) {
+            return createSkinPolygonMask(for: faces, imageExtent: imageExtent)
+        }
         var combinedMask: CIImage?
         for face in faces {
             let faceRect = CGRect(
@@ -195,6 +243,118 @@ class BeautyFilterProcessor {
             }
         }
         return combinedMask ?? CIImage(color: CIColor.black).cropped(to: imageExtent)
+    }
+
+    // MARK: - Vision-landmark skin polygon mask
+
+    /// Cached polygon mask, keyed by image extent + smoothed landmark fingerprint. Rebuilt on the CPU
+    /// via CGContext at every detection cycle (~6 Hz) and reused for in-between frames so the per-frame
+    /// cost stays near zero. The mask is feathered so the edge between smoothed and untouched pixels
+    /// is invisible.
+    private var cachedSkinMask: CIImage?
+    private var cachedSkinMaskKey: String = ""
+
+    private func createSkinPolygonMask(for faces: [DetectedFace], imageExtent: CGRect) -> CIImage {
+        // Build a cache key from face bounding boxes — landmarks come from the same smoothing pipeline,
+        // so when boxes are unchanged, the polygons are too.
+        let key = "\(Int(imageExtent.width))x\(Int(imageExtent.height))|" + faces.map {
+            String(format: "%.4f,%.4f,%.4f,%.4f", $0.boundingBox.origin.x, $0.boundingBox.origin.y, $0.boundingBox.width, $0.boundingBox.height)
+        }.joined(separator: ";")
+        if key == cachedSkinMaskKey, let cached = cachedSkinMask { return cached }
+
+        // Mask resolution: cap the longer side at 1024 px. Mask is upsampled with bilinear filtering
+        // when blended, so this is invisible visually and ~16x cheaper to draw than at full 4K.
+        let longest: CGFloat = 1024
+        let scale = min(1.0, longest / max(imageExtent.width, imageExtent.height))
+        let maskWidth  = Int((imageExtent.width  * scale).rounded())
+        let maskHeight = Int((imageExtent.height * scale).rounded())
+        guard maskWidth > 0, maskHeight > 0 else { return CIImage(color: .black).cropped(to: imageExtent) }
+
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        guard let ctx = CGContext(data: nil, width: maskWidth, height: maskHeight, bitsPerComponent: 8,
+                                  bytesPerRow: maskWidth, space: colorSpace,
+                                  bitmapInfo: CGImageAlphaInfo.none.rawValue) else {
+            return CIImage(color: .black).cropped(to: imageExtent)
+        }
+        ctx.setFillColor(CGColor(gray: 0, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: maskWidth, height: maskHeight))
+
+        let toMask: (CGPoint) -> CGPoint = { p in
+            // Polygon points are in Y-down screen-normalized space; CGContext is Y-up. Flip on Y so the
+            // resulting mask aligns with the source CIImage (which Core Image treats as Y-up).
+            CGPoint(x: p.x * CGFloat(maskWidth), y: (1.0 - p.y) * CGFloat(maskHeight))
+        }
+
+        for face in faces {
+            // Fill the face contour polygon white.
+            if let contour = face.faceContour, contour.count >= 3 {
+                ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+                fillPolygon(in: ctx, points: contour.map(toMask))
+            } else {
+                // Bounding-box ellipse fallback for faces without contour landmarks. Y-down → Y-up flip.
+                let bb = face.boundingBox
+                let rect = CGRect(x: bb.origin.x * CGFloat(maskWidth),
+                                  y: (1.0 - bb.origin.y - bb.height) * CGFloat(maskHeight),
+                                  width:  bb.width  * CGFloat(maskWidth),
+                                  height: bb.height * CGFloat(maskHeight))
+                ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+                ctx.fillEllipse(in: rect)
+            }
+
+            // Carve out features (eyes, lips, brows, nostril area) so smoothing doesn't touch them.
+            ctx.setFillColor(CGColor(gray: 0, alpha: 1))
+            for poly in [face.leftEye, face.rightEye, face.outerLips, face.leftEyebrow, face.rightEyebrow] {
+                if let poly = poly, poly.count >= 3 {
+                    fillPolygon(in: ctx, points: expandedPolygon(poly.map(toMask), pad: 4))
+                }
+            }
+        }
+
+        guard let cgImage = ctx.makeImage() else { return CIImage(color: .black).cropped(to: imageExtent) }
+        var mask = CIImage(cgImage: cgImage)
+
+        // Scale the mask back up to the original image extent.
+        if scale < 1.0 {
+            let inv = 1.0 / scale
+            mask = mask.transformed(by: CGAffineTransform(scaleX: inv, y: inv))
+        }
+        // Translate to match imageExtent.origin.
+        mask = mask.transformed(by: CGAffineTransform(translationX: imageExtent.origin.x, y: imageExtent.origin.y))
+
+        // Feather the edge so smoothed and original blend invisibly. Radius scales with image size so
+        // a 4K frame gets a proportional feather, not a hairline.
+        if let blur = CIFilter(name: "CIGaussianBlur") {
+            blur.setValue(mask, forKey: kCIInputImageKey)
+            let featherRadius = max(imageExtent.width, imageExtent.height) * 0.006
+            blur.setValue(featherRadius, forKey: kCIInputRadiusKey)
+            if let blurred = blur.outputImage?.cropped(to: imageExtent) { mask = blurred }
+        }
+
+        cachedSkinMask = mask
+        cachedSkinMaskKey = key
+        return mask
+    }
+
+    private func fillPolygon(in ctx: CGContext, points: [CGPoint]) {
+        guard let first = points.first else { return }
+        ctx.beginPath()
+        ctx.move(to: first)
+        for p in points.dropFirst() { ctx.addLine(to: p) }
+        ctx.closePath()
+        ctx.fillPath()
+    }
+
+    /// Push polygon points slightly outward from their centroid so feature cutouts have a small
+    /// safety margin around each landmark.
+    private func expandedPolygon(_ points: [CGPoint], pad: CGFloat) -> [CGPoint] {
+        guard !points.isEmpty else { return points }
+        let cx = points.reduce(0) { $0 + $1.x } / CGFloat(points.count)
+        let cy = points.reduce(0) { $0 + $1.y } / CGFloat(points.count)
+        return points.map { p in
+            let dx = p.x - cx, dy = p.y - cy
+            let d = max(0.001, sqrt(dx * dx + dy * dy))
+            return CGPoint(x: p.x + dx / d * pad, y: p.y + dy / d * pad)
+        }
     }
 
     private func applyLipPlump(to image: CIImage) -> CIImage {
@@ -326,10 +486,13 @@ class BeautyFilterProcessor {
 
     private func applyFaceOnlySmooth(to image: CIImage) -> CIImage {
         guard !detectedFaces.isEmpty else { return image }
+        // Hide smoothing while the face is moving so users don't see the mask lagging.
+        let effectiveIntensity = faceSmoothIntensity * motionFade
+        if effectiveIntensity < 0.01 { return image }
         if let processor = skinSmoothingProcessor {
-            processor.sigmaSpace = 5.0 + faceSmoothIntensity * 5.0
-            processor.sigmaColor = 0.05 + (1.0 - faceSmoothIntensity) * 0.1
-            return processor.processImage(image, faces: detectedFaces, intensity: faceSmoothIntensity)
+            processor.sigmaSpace = 5.0 + effectiveIntensity * 5.0
+            processor.sigmaColor = 0.05 + (1.0 - effectiveIntensity) * 0.1
+            return processor.processImage(image, faces: detectedFaces, intensity: effectiveIntensity)
         }
         return applyFaceOnlySmoothFallback(to: image)
     }
@@ -409,6 +572,10 @@ class BeautyFilterProcessor {
     }
 
     private func createFaceMask(for faces: [DetectedFace], imageExtent: CGRect) -> CIImage {
+        // Prefer the precise Vision-landmark polygon mask when available.
+        if faces.contains(where: { $0.faceContour != nil && !($0.faceContour?.isEmpty ?? true) }) {
+            return createSkinPolygonMask(for: faces, imageExtent: imageExtent)
+        }
         var combinedMask: CIImage?
         for face in faces {
             let faceRect = CGRect(

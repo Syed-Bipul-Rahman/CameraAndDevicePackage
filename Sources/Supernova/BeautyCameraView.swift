@@ -386,6 +386,13 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
         do {
             try device.lockForConfiguration()
             device.activeFormat = format
+            // Lock to 30 fps inside the chosen format. The format was filtered to support >=30 fps in
+            // bestFormat(), so this is safe and stops iOS from auto-throttling under heavy filter load.
+            let target = CMTime(value: 1, timescale: 30)
+            if format.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 }) {
+                device.activeVideoMinFrameDuration = target
+                device.activeVideoMaxFrameDuration = target
+            }
             if device.isExposureModeSupported(.continuousAutoExposure) {
                 device.exposureMode = .continuousAutoExposure
             }
