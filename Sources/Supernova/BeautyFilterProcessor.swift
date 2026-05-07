@@ -203,43 +203,42 @@ class BeautyFilterProcessor {
 
     private func applyMilkySkin(to image: CIImage) -> CIImage {
         let imageExtent = image.extent
-        // motionFade hides the effect during head movement so users don't see the mask lag behind the face.
-        let intensity = Double(milkySkinIntensity) * 0.5 * Double(motionFade)
+        let intensity = Double(milkySkinIntensity) * Double(motionFade)
         if intensity < 0.001 { return image }
 
-        let downscale: CGFloat = 0.5
-        let downTransform = CGAffineTransform(scaleX: downscale, y: downscale)
-        let upTransform   = CGAffineTransform(scaleX: 1.0 / downscale, y: 1.0 / downscale)
+        // Apply the milky tone DIRECTLY to the original image. CIColorControls is a per-pixel color
+        // transform — it changes brightness/saturation/contrast WITHOUT touching detail (pores, hair,
+        // fine wrinkles all stay sharp because no blur is applied to the result).
+        //
+        //   brightness +0.12 × intensity  → noticeably lighter
+        //   saturation -0.35 × intensity  → creamy/desaturated tone
+        //   contrast   -0.05 × intensity  → softer shadows
+        guard let toneFilter = CIFilter(name: "CIColorControls") else { return image }
+        toneFilter.setValue(image, forKey: kCIInputImageKey)
+        toneFilter.setValue(intensity * 0.12, forKey: kCIInputBrightnessKey)
+        toneFilter.setValue(1.0 - intensity * 0.35, forKey: kCIInputSaturationKey)
+        toneFilter.setValue(1.0 - intensity * 0.05, forKey: kCIInputContrastKey)
+        guard var milkyImage = toneFilter.outputImage?.cropped(to: imageExtent) else { return image }
 
-        var milkyImage = image.transformed(by: downTransform)
-        let workingExtent = milkyImage.extent
-
-        if let blurFilter = CIFilter(name: "CIGaussianBlur"),
-           let dissolve  = CIFilter(name: "CIDissolveTransition") {
-            blurFilter.setValue(milkyImage, forKey: kCIInputImageKey)
-            blurFilter.setValue((2.0 + intensity * 4.0) * downscale, forKey: kCIInputRadiusKey)
-            if let blurred = blurFilter.outputImage?.cropped(to: workingExtent) {
+        // Subtle smoothing: blend a small blur of the toned image with the toned image at 30%, so the
+        // skin-tone evening-out has some visual "creaminess" without losing pore-level detail.
+        if let blur = CIFilter(name: "CIGaussianBlur") {
+            blur.setValue(milkyImage, forKey: kCIInputImageKey)
+            blur.setValue(3.0 + intensity * 5.0, forKey: kCIInputRadiusKey)
+            if let blurred = blur.outputImage?.cropped(to: imageExtent),
+               let dissolve = CIFilter(name: "CIDissolveTransition") {
                 dissolve.setValue(milkyImage, forKey: kCIInputImageKey)
                 dissolve.setValue(blurred, forKey: kCIInputTargetImageKey)
-                dissolve.setValue(intensity * 0.5, forKey: kCIInputTimeKey)
-                if let result = dissolve.outputImage?.cropped(to: workingExtent) { milkyImage = result }
+                dissolve.setValue(0.30, forKey: kCIInputTimeKey)   // 70% original detail, 30% blurred
+                if let mixed = dissolve.outputImage?.cropped(to: imageExtent) {
+                    milkyImage = mixed
+                }
             }
         }
 
-        if let colorFilter = CIFilter(name: "CIColorControls") {
-            colorFilter.setValue(milkyImage, forKey: kCIInputImageKey)
-            // Lower brightness lift (was 0.12). The lift is what makes a misaligned mask edge look like
-            // a "white halo" — softer lift means smaller halo even if the mask is slightly off-face.
-            // The smoothing+desat still produce the milky look; brightness only adds the porcelain glow.
-            colorFilter.setValue(intensity * 0.06, forKey: kCIInputBrightnessKey)
-            colorFilter.setValue(1.0 - intensity * 0.30, forKey: kCIInputSaturationKey)
-            colorFilter.setValue(1.0 - intensity * 0.10, forKey: kCIInputContrastKey)
-            if let result = colorFilter.outputImage?.cropped(to: workingExtent) { milkyImage = result }
-        }
-
-        milkyImage = milkyImage.transformed(by: upTransform).cropped(to: imageExtent)
-
-        if !detectedFaces.isEmpty {
+        // Mask onto face skin only — ML pixel-perfect mask if available, polygon fallback otherwise.
+        let useMask = !detectedFaces.isEmpty || externalSkinMask != nil
+        if useMask {
             let faceMask = createMilkyFaceMask(for: detectedFaces, imageExtent: imageExtent)
             if let blendFilter = CIFilter(name: "CIBlendWithMask") {
                 blendFilter.setValue(milkyImage, forKey: kCIInputImageKey)
@@ -248,8 +247,55 @@ class BeautyFilterProcessor {
                 return blendFilter.outputImage?.cropped(to: imageExtent) ?? milkyImage
             }
         }
-
         return milkyImage
+    }
+
+    // MARK: - Frequency-separation helpers
+
+    private func gaussianBlurredFullExtent(_ image: CIImage, radius: Double) -> CIImage? {
+        guard let f = CIFilter(name: "CIGaussianBlur") else { return nil }
+        f.setValue(image, forKey: kCIInputImageKey)
+        f.setValue(radius, forKey: kCIInputRadiusKey)
+        return f.outputImage?.cropped(to: image.extent)
+    }
+
+    private func milkyToneAdjust(_ image: CIImage, intensity: Double) -> CIImage? {
+        guard let f = CIFilter(name: "CIColorControls") else { return nil }
+        f.setValue(image, forKey: kCIInputImageKey)
+        // Tuned for porcelain look at intensity=1.0:
+        //   +0.18 brightness lift  → noticeably lighter skin
+        //   -0.50 saturation        → distinctly desaturated, "creamy" tone
+        //   -0.10 contrast          → softer look, less harsh shadows
+        // These are applied to the LOW-FREQUENCY layer only, then propagated to the original via
+        // toneShift — so detail (pores, hair, lashes) stays sharp.
+        f.setValue(intensity * 0.18, forKey: kCIInputBrightnessKey)
+        f.setValue(1.0 - intensity * 0.50, forKey: kCIInputSaturationKey)
+        f.setValue(1.0 - intensity * 0.10, forKey: kCIInputContrastKey)
+        return f.outputImage?.cropped(to: image.extent)
+    }
+
+    /// Per-channel out = scale * in + bias. Used to negate an image (-1 / 0) for signed subtraction
+    /// via CIAdditionCompositing.
+    private func scaleAndOffset(_ image: CIImage, scale: Double, bias: Double) -> CIImage? {
+        guard let f = CIFilter(name: "CIColorMatrix") else { return nil }
+        f.setValue(image, forKey: kCIInputImageKey)
+        let s = CGFloat(scale)
+        let b = CGFloat(bias)
+        f.setValue(CIVector(x: s, y: 0, z: 0, w: 0), forKey: "inputRVector")
+        f.setValue(CIVector(x: 0, y: s, z: 0, w: 0), forKey: "inputGVector")
+        f.setValue(CIVector(x: 0, y: 0, z: s, w: 0), forKey: "inputBVector")
+        f.setValue(CIVector(x: 0, y: 0, z: 0, w: 1), forKey: "inputAVector")
+        f.setValue(CIVector(x: b, y: b, z: b, w: 0), forKey: "inputBiasVector")
+        return f.outputImage?.cropped(to: image.extent)
+    }
+
+    /// out = a + b (signed, no clamp until final materialization). CIAdditionCompositing keeps
+    /// out-of-range values until the working color space materializes them.
+    private func additionComposite(_ a: CIImage, _ b: CIImage) -> CIImage? {
+        guard let f = CIFilter(name: "CIAdditionCompositing") else { return nil }
+        f.setValue(a, forKey: kCIInputImageKey)
+        f.setValue(b, forKey: kCIInputBackgroundImageKey)
+        return f.outputImage?.cropped(to: a.extent)
     }
 
     private func createMilkyFaceMask(for faces: [DetectedFace], imageExtent: CGRect) -> CIImage {
