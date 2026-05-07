@@ -26,6 +26,24 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
     // the session queue (which would block startRunning/setFocus/etc) or the render queue (live frames).
     private let photoProcessingQueue = DispatchQueue(label: "com.supernova.camera.photo", qos: .userInitiated)
 
+    /// Dedicated CIContext for the photo pipeline. The live `ciContext` uses sRGB/deviceRGB as its
+    /// working color space (cheap for video frames). Routing photos through it forces a sRGB ↔ P3
+    /// gamut round-trip that clips highlights and dulls saturation. This context works in displayP3
+    /// natively so a P3-tagged HEIC stays in P3 the whole way through.
+    private lazy var photoCIContext: CIContext = {
+        let p3 = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
+        let opts: [CIContextOption: Any] = [
+            .workingColorSpace: p3,
+            .outputColorSpace: p3,
+            .highQualityDownsample: true,
+            .cacheIntermediates: true
+        ]
+        if let device = MTLCreateSystemDefaultDevice() {
+            return CIContext(mtlDevice: device, options: opts)
+        }
+        return CIContext(options: opts)
+    }()
+
     private var metalDevice: MTLDevice?
     private var commandQueue: MTLCommandQueue?
     private var ciContext: CIContext?
@@ -210,6 +228,14 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
         return img
     }
 
+    /// Read the embedded color space from the captured HEIC bytes so we can render into the same gamut
+    /// the camera produced. Modern iPhones tag photos as Display P3; older devices may use sRGB.
+    private func sourceColorSpace(from data: Data) -> CGColorSpace? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let cg = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+        return cg.colorSpace
+    }
+
     /// Mirror an image horizontally — used for front-camera selfies so the saved photo matches
     /// the mirrored live preview (which is mirrored at the videoOutput connection level).
     private func mirrorHorizontally(_ image: CIImage) -> CIImage {
@@ -336,19 +362,34 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
 
     // MARK: - Camera Setup
 
-    /// Returns the best camera device available for the given position.
-    /// Back: prefer multi-lens (Triple > DualWide > Dual > Wide) so the system can swap optical lenses on zoom.
-    /// Front: only the wide-angle exists on every iPhone.
+    /// Returns the best camera device available for the given position, ranked by **max photo area**.
+    /// On iPhone 15 Pro+, the standalone wide-angle supports 48 MP stills, while the triple-camera
+    /// virtual device caps at 12 MP — so we'd lose 4× resolution if we blindly preferred multi-lens.
+    /// Apple's stock Camera also uses the wide-angle directly for max-resolution stills.
     private func bestCamera(position: AVCaptureDevice.Position) -> AVCaptureDevice? {
+        let candidates: [AVCaptureDevice.DeviceType]
         if position == .back {
-            let preferred: [AVCaptureDevice.DeviceType] = [
-                .builtInTripleCamera, .builtInDualWideCamera, .builtInDualCamera, .builtInWideAngleCamera
-            ]
-            for type in preferred {
-                if let cam = AVCaptureDevice.default(type, for: .video, position: .back) { return cam }
+            candidates = [.builtInWideAngleCamera, .builtInTripleCamera, .builtInDualWideCamera, .builtInDualCamera]
+        } else {
+            candidates = [.builtInWideAngleCamera]
+        }
+
+        var best: (device: AVCaptureDevice, area: Int)?
+        for type in candidates {
+            guard let cam = AVCaptureDevice.default(type, for: .video, position: position) else { continue }
+            let area = maxPhotoArea(for: cam)
+            if let current = best {
+                if area > current.area { best = (cam, area) }
+            } else {
+                best = (cam, area)
             }
         }
-        return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)
+        return best?.device ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)
+    }
+
+    /// The largest still-photo area across all of a device's supported formats. Used to compare devices.
+    private func maxPhotoArea(for device: AVCaptureDevice) -> Int {
+        device.formats.map { photoArea(of: $0) }.max() ?? 0
     }
 
     /// Picks the device's best format: highest still-photo dimensions, tie-breaking on highest video dims,
@@ -368,7 +409,8 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
 
     private func photoArea(of fmt: AVCaptureDevice.Format) -> Int {
         if #available(iOS 16.0, *) {
-            if let dim = fmt.supportedMaxPhotoDimensions.last {
+            // The array's order isn't documented as sorted — pick by area to be robust.
+            if let dim = fmt.supportedMaxPhotoDimensions.max(by: { (Int($0.width) * Int($0.height)) < (Int($1.width) * Int($1.height)) }) {
                 return Int(dim.width) * Int(dim.height)
             }
         }
@@ -466,7 +508,8 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
             let videoDevice = session.inputs
                 .compactMap { $0 as? AVCaptureDeviceInput }
                 .first { $0.device.hasMediaType(.video) }?.device
-            if let maxDim = videoDevice?.activeFormat.supportedMaxPhotoDimensions.last {
+            if let dims = videoDevice?.activeFormat.supportedMaxPhotoDimensions,
+               let maxDim = dims.max(by: { (Int($0.width) * Int($0.height)) < (Int($1.width) * Int($1.height)) }) {
                 photoOut.maxPhotoDimensions = maxDim
             }
         }
@@ -673,7 +716,8 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
         }
 
         if #available(iOS 16.0, *) {
-            if let maxDim = newCamera.activeFormat.supportedMaxPhotoDimensions.last {
+            if let maxDim = newCamera.activeFormat.supportedMaxPhotoDimensions
+                .max(by: { (Int($0.width) * Int($0.height)) < (Int($1.width) * Int($1.height)) }) {
                 photoOutput?.maxPhotoDimensions = maxDim
             }
         }
@@ -865,13 +909,17 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
                 .compactMap { $0 as? AVCaptureDeviceInput }
                 .first { $0.device.hasMediaType(.video) }?.device
 
+            // Pick by area, not by .last — array order isn't documented as sorted.
+            let areaCmp: (CMVideoDimensions, CMVideoDimensions) -> Bool = {
+                (Int($0.width) * Int($0.height)) < (Int($1.width) * Int($1.height))
+            }
             if let device = videoDevice,
-               let deviceMaxDim = device.activeFormat.supportedMaxPhotoDimensions.last {
+               let deviceMaxDim = device.activeFormat.supportedMaxPhotoDimensions.max(by: areaCmp) {
                 let outputMax = photoOutput.maxPhotoDimensions
                 if outputMax.width > 0 && outputMax.height > 0 {
                     let safeDim = device.activeFormat.supportedMaxPhotoDimensions
                         .filter { $0.width <= outputMax.width && $0.height <= outputMax.height }
-                        .last ?? outputMax
+                        .max(by: areaCmp) ?? outputMax
                     settings.maxPhotoDimensions = safeDim
                 } else {
                     photoOutput.maxPhotoDimensions = deviceMaxDim
@@ -1375,10 +1423,20 @@ extension BeautyCameraView: AVCapturePhotoCaptureDelegate {
             if isFront { output = self.mirrorHorizontally(output) }
             output = self.cropToPreviewAspect(output, previewAspect: previewAspect)
 
-            // Render at 16-bit float so we don't clip the sensor's bit depth on the way out.
-            // Wide-gamut HEIC + quality 1.0 keeps the saved photo as close as possible to the source.
-            let p3 = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
-            guard let cgImage = self.ciContext?.createCGImage(output, from: output.extent, format: .RGBAh, colorSpace: p3) else {
+            // Pull the source HEIC's actual color space so we render into the same gamut the sensor
+            // produced. Falls back to displayP3 (the iPhone default) if metadata is missing.
+            let renderColorSpace = self.sourceColorSpace(from: imageData)
+                ?? CGColorSpace(name: CGColorSpace.displayP3)
+                ?? CGColorSpaceCreateDeviceRGB()
+
+            // Render at 16-bit float through the dedicated photo context (P3 working color space).
+            // No sRGB↔P3 round-trip → highlights and saturation match the original sensor output.
+            guard let cgImage = self.photoCIContext.createCGImage(
+                output,
+                from: output.extent,
+                format: .RGBAh,
+                colorSpace: renderColorSpace
+            ) else {
                 DispatchQueue.main.async { completion(.failure(BeautyCameraError.captureError("Failed to render captured photo"))) }
                 return
             }
