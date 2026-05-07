@@ -206,13 +206,9 @@ class BeautyFilterProcessor {
         let intensity = Double(milkySkinIntensity) * Double(motionFade)
         if intensity < 0.001 { return image }
 
-        // Apply the milky tone DIRECTLY to the original image. CIColorControls is a per-pixel color
-        // transform — it changes brightness/saturation/contrast WITHOUT touching detail (pores, hair,
-        // fine wrinkles all stay sharp because no blur is applied to the result).
-        //
-        //   brightness +0.12 × intensity  → noticeably lighter
-        //   saturation -0.35 × intensity  → creamy/desaturated tone
-        //   contrast   -0.05 × intensity  → softer shadows
+        // === 1. Tone shift (brightness / saturation / contrast) ===
+        // Applied directly to original image — preserves all detail (CIColorControls is per-pixel,
+        // doesn't blur). Same as the previous-known-good version.
         guard let toneFilter = CIFilter(name: "CIColorControls") else { return image }
         toneFilter.setValue(image, forKey: kCIInputImageKey)
         toneFilter.setValue(intensity * 0.12, forKey: kCIInputBrightnessKey)
@@ -220,8 +216,27 @@ class BeautyFilterProcessor {
         toneFilter.setValue(1.0 - intensity * 0.05, forKey: kCIInputContrastKey)
         guard var milkyImage = toneFilter.outputImage?.cropped(to: imageExtent) else { return image }
 
-        // Subtle smoothing: blend a small blur of the toned image with the toned image at 30%, so the
-        // skin-tone evening-out has some visual "creaminess" without losing pore-level detail.
+        // === 2. Warm cast (peach / cream) ===
+        // Pure desaturation pulls skin toward grey, which reads as "lifeless." A small target-neutral
+        // shift toward warmer Kelvin (lower K = warmer, more orange/yellow) gives the skin a peach
+        // undertone — what pro apps call "alive porcelain." Best-effort: skips silently if the filter
+        // fails, leaves milkyImage as the tone-only version.
+        if let warmFilter = CIFilter(name: "CITemperatureAndTint") {
+            warmFilter.setValue(milkyImage, forKey: kCIInputImageKey)
+            warmFilter.setValue(CIVector(x: 6500, y: 0), forKey: "inputNeutral")
+            // Up to ~700K shift at full intensity. Subtle; a 1500K shift would be obviously orange.
+            warmFilter.setValue(CIVector(x: 6500 - intensity * 700, y: 0), forKey: "inputTargetNeutral")
+            if let warmed = warmFilter.outputImage?.cropped(to: imageExtent) {
+                milkyImage = warmed
+            }
+        }
+
+        // === 3. Subtle texture smoothing ===
+        // Restored to the working Gaussian-blur mix. The previous bilateral attempt used
+        // SkinSmoothingProcessor's internal elliptical mask, which fights our ML mask and creates
+        // a visible rectangular ghost around the face. Until we have a bilateral pass that uses
+        // OUR mask, this Gaussian-blur 30%-mix is the safe path: no mask conflict, ~2ms cost,
+        // gives subtle "creaminess" without pore loss.
         if let blur = CIFilter(name: "CIGaussianBlur") {
             blur.setValue(milkyImage, forKey: kCIInputImageKey)
             blur.setValue(3.0 + intensity * 5.0, forKey: kCIInputRadiusKey)
@@ -236,7 +251,8 @@ class BeautyFilterProcessor {
             }
         }
 
-        // Mask onto face skin only — ML pixel-perfect mask if available, polygon fallback otherwise.
+        // === 4. Mask onto face skin only ===
+        // ML pixel-perfect mask if available, polygon fallback otherwise. Unchanged from before.
         let useMask = !detectedFaces.isEmpty || externalSkinMask != nil
         if useMask {
             let faceMask = createMilkyFaceMask(for: detectedFaces, imageExtent: imageExtent)
