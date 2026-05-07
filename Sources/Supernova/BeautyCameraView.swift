@@ -4,6 +4,7 @@ import Metal
 import MetalKit
 import Photos
 import ImageIO
+import Vision
 
 public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
 
@@ -70,7 +71,13 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
     private var lastAppliedBlurFrames: [String: CGRect] = [:]
 
     private let faceDetectionService = FaceDetectionService()
+    private let faceParsingService = FaceParsingService()
     private var lastImageSize: CGSize = .zero
+
+    /// Heavily-smoothed bounding box for the on-screen overlay. The detection-side smoothing factor is
+    /// kept light (0.15) so the *mask* tracks the face responsively, but the visible overlay rectangle
+    /// would jitter at that smoothing level — we apply a much heavier EMA here just for the visual.
+    private var displayOverlayBBox: CGRect?
 
     private var photoOutput: AVCapturePhotoOutput?
     private var photoCaptureCompletion: ((Result<String, Error>) -> Void)?
@@ -226,6 +233,20 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
             if let out = sh.outputImage?.cropped(to: img.extent) { img = out }
         }
         return img
+    }
+
+    /// Synchronous Vision face detection on a one-shot CIImage. Used during photo capture to find the
+    /// face in the captured photo (not in the live preview). Returns image-normalized Y-DOWN bbox to
+    /// match FaceDetectionService's convention so FaceParsingService accepts it directly.
+    private func detectFirstFaceBBox(in image: CIImage) -> CGRect? {
+        let request = VNDetectFaceRectanglesRequest()
+        let handler = VNImageRequestHandler(ciImage: image, options: [:])
+        do { try handler.perform([request]) } catch { return nil }
+        guard let face = (request.results as? [VNFaceObservation])?.first else { return nil }
+        let v = face.boundingBox  // Y-up
+        return CGRect(x: v.origin.x,
+                      y: 1.0 - v.origin.y - v.height,
+                      width: v.width, height: v.height)
     }
 
     /// Read the embedded color space from the captured HEIC bytes so we can render into the same gamut
@@ -845,10 +866,34 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
             || faceTrackingEnabled
 
         if needsFaceDetection {
+            // Snapshot the input image's extent on the capture queue — needed by the parsing service
+            // to map the model output back into image-extent coordinates.
+            let parsingExtent = inputImage.extent
+            let parsingImage = inputImage
             faceDetectionService.detectFaces(in: inputImage, imageSize: imageSize) { [weak self] faces in
                 guard let self = self else { return }
                 self.renderQueue.async { [weak self] in
                     self?.filterProcessor.detectedFaces = faces
+                }
+
+                // Kick off ML face parsing on the same cadence as detection. Result is set on the
+                // filter processor as soon as it's ready; until then the polygon mask continues to be used.
+                if self.faceParsingService.isAvailable, let firstFace = faces.first {
+                    self.faceParsingService.parse(
+                        image: parsingImage,
+                        faceBBox: firstFace.boundingBox,
+                        imageExtent: parsingExtent
+                    ) { [weak self] mask in
+                        self?.renderQueue.async { [weak self] in
+                            self?.filterProcessor.externalSkinMask = mask
+                        }
+                    }
+                } else {
+                    // No faces (or model unavailable) — clear any stale ML mask so we don't leak it
+                    // onto the next frame. The polygon mask (or no mask) takes over.
+                    self.renderQueue.async { [weak self] in
+                        self?.filterProcessor.externalSkinMask = nil
+                    }
                 }
 
                 if self.faceTrackingEnabled {
@@ -865,12 +910,30 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
                         let ox = (1.0 - sx) / 2.0
                         let oy = (1.0 - sy) / 2.0
 
-                        let facesData = faces.map { face -> [String: Double] in [
-                            "x": Double(face.boundingBox.origin.x * sx + ox),
-                            "y": Double(face.boundingBox.origin.y * sy + oy),
-                            "width":  Double(face.boundingBox.width * sx),
-                            "height": Double(face.boundingBox.height * sy),
-                        ]}
+                        // Heavy smoothing for the visible overlay box only. Mask path uses the
+                        // unsmoothed-by-this-EMA bbox internally, so the mask still tracks the face.
+                        let visualSmoothing: CGFloat = 0.78
+                        let facesData = faces.map { face -> [String: Double] in
+                            let bbox: CGRect
+                            if let prev = self.displayOverlayBBox {
+                                bbox = CGRect(
+                                    x: prev.origin.x * visualSmoothing + face.boundingBox.origin.x * (1 - visualSmoothing),
+                                    y: prev.origin.y * visualSmoothing + face.boundingBox.origin.y * (1 - visualSmoothing),
+                                    width:  prev.width  * visualSmoothing + face.boundingBox.width  * (1 - visualSmoothing),
+                                    height: prev.height * visualSmoothing + face.boundingBox.height * (1 - visualSmoothing)
+                                )
+                            } else {
+                                bbox = face.boundingBox
+                            }
+                            self.displayOverlayBBox = bbox
+                            return [
+                                "x": Double(bbox.origin.x * sx + ox),
+                                "y": Double(bbox.origin.y * sy + oy),
+                                "width":  Double(bbox.width  * sx),
+                                "height": Double(bbox.height * sy),
+                            ]
+                        }
+                        if faces.isEmpty { self.displayOverlayBBox = nil }
                         self.delegate?.beautyCameraView(self, didDetectFaces: facesData)
                     }
                 }
@@ -1416,8 +1479,20 @@ extension BeautyCameraView: AVCapturePhotoCaptureDelegate {
 
             var output: CIImage = ciImage
             if filtersActive {
+                // Re-run face detection + parsing on the CAPTURED photo so the mask matches the photo's
+                // pixels (not the lagged live-preview mask). Brief race window where the live preview
+                // could see this photo-specific mask is acceptable — both are at native sensor resolution.
+                let savedExternalMask = self.filterProcessor.externalSkinMask
+                if let bbox = self.detectFirstFaceBBox(in: ciImage),
+                   let photoMask = self.faceParsingService.parseSync(
+                       image: ciImage, faceBBox: bbox, imageExtent: ciImage.extent
+                   ) {
+                    self.filterProcessor.externalSkinMask = photoMask
+                }
                 self.filterProcessor.invalidateSegmentationCache()
                 output = self.filterProcessor.processImage(ciImage)
+                // Restore the live mask immediately so the preview isn't left with the photo's mask.
+                self.filterProcessor.externalSkinMask = savedExternalMask
             }
             // Match the live preview's left-right orientation for selfie shots.
             if isFront { output = self.mirrorHorizontally(output) }

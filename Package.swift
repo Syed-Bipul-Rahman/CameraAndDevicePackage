@@ -14,7 +14,13 @@ let package = Package(
             name: "Supernova",
             path: "Sources/Supernova",
             resources: [
-                .process("Resources")
+                // .mlmodelc is a compiled-model directory bundle. .process() walks into it and the inner
+                // coremldata.bin files at /, /analytics, and /neural_network_optionals collide in the
+                // bundle's flat resource namespace. Use .copy() to drop it in verbatim, structure intact.
+                .copy("Resources/FaceParsing.mlmodelc"),
+                .process("Resources/tut1.jpg"),
+                .process("Resources/tut2.jpg"),
+                .process("Resources/tut3.jpg")
             ]
         )
     ]

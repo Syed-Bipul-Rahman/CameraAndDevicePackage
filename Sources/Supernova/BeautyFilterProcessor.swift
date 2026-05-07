@@ -39,42 +39,73 @@ class BeautyFilterProcessor {
         didSet { updateMotionFade(previous: oldValue, current: detectedFaces) }
     }
 
+    /// External per-pixel skin mask, set by FaceParsingService on the main / parsing queue.
+    /// When present, milky and face-only-smooth use this instead of the Vision-landmark polygon mask.
+    /// Thread-safe via the lock — accessed from the render queue and written from the parsing queue.
+    private let externalMaskLock = NSLock()
+    private var _externalSkinMask: CIImage?
+    var externalSkinMask: CIImage? {
+        get { externalMaskLock.lock(); defer { externalMaskLock.unlock() }; return _externalSkinMask }
+        set { externalMaskLock.lock(); _externalSkinMask = newValue; externalMaskLock.unlock() }
+    }
+
     // Motion-aware fade: pro apps hide the effect while the face is moving and bring it back once it
     // settles, because a rendered mask always lags reality by some milliseconds. Matching that here.
     private var motionFade: Float = 1.0
-    private var lastFaceCenter: CGPoint?
     private var lastFaceWidth: CGFloat = 0
+    /// Heavily-smoothed reference position. Decoupled from the rendering smoothing (which has to be
+    /// light so the mask tracks the face responsively) — we use a separate slow EMA here so that the
+    /// jitter in Vision's bounding box averages to zero around the true face position. Real movement
+    /// shifts the reference slowly, so |current - reference| spikes during real movement only.
+    private var stableReference: CGPoint?
+    /// Smoothed motion magnitude. Rejects single-frame spikes that come from detection noise.
+    private var motionEMA: Float = 0
 
     private func updateMotionFade(previous: [DetectedFace], current: [DetectedFace]) {
         guard let face = current.first else {
             motionFade = 0
-            lastFaceCenter = nil
+            motionEMA = 0
+            stableReference = nil
             lastFaceWidth = 0
             return
         }
         let center = CGPoint(x: face.boundingBox.midX, y: face.boundingBox.midY)
         let faceWidth = face.boundingBox.width
-        if let last = lastFaceCenter, lastFaceWidth > 0 {
-            // Distance moved as a fraction of face width — scale-independent.
-            let dx = center.x - last.x
-            let dy = center.y - last.y
+
+        if let ref = stableReference, lastFaceWidth > 0 {
+            // Distance from current detection to the stable reference, normalized to face width.
+            // When face is still: ref converges to true center, jitter cancels → distance ≈ 0.
+            // When face moves: ref lags → distance = real translation, large.
+            let dx = center.x - ref.x
+            let dy = center.y - ref.y
             let distance = sqrt(dx * dx + dy * dy)
-            let normalized = Float(distance / max(0.05, faceWidth))
-            // > 8% of face width per detection cycle = clear movement → drop fade fast.
-            // Less than 3% = essentially still → ramp fade up smoothly.
-            if normalized > 0.08 {
-                motionFade = max(0, motionFade - 0.6)
-            } else if normalized < 0.03 {
-                motionFade = min(1.0, motionFade + 0.18)
-            } else {
-                // Mid range: hold steady, slow ramp.
-                motionFade = min(1.0, motionFade + 0.06)
+            let raw = Float(distance / max(0.05, faceWidth))
+
+            // Smooth the motion magnitude itself so single-frame detection spikes don't kill the effect.
+            motionEMA = motionEMA * 0.55 + raw * 0.45
+
+            //   > 5% smoothed motion = real movement → kill effect fast
+            //   < 2% smoothed motion = held essentially still → ramp effect back in
+            //   2-5% = "noisy hold" zone, motionFade holds steady (no blink)
+            if motionEMA > 0.05 {
+                motionFade = max(0, motionFade - 0.85)
+            } else if motionEMA < 0.02 {
+                motionFade = min(1.0, motionFade + 0.20)
             }
+            // else: hold motionFade as-is — prevents in/out flicker from borderline shake.
+
+            // Update reference with heavy smoothing — slow enough that detection jitter averages out
+            // around the true center, but fast enough to follow real movement once the EMA decays.
+            stableReference = CGPoint(
+                x: ref.x * 0.85 + center.x * 0.15,
+                y: ref.y * 0.85 + center.y * 0.15
+            )
         } else {
             // First face we've seen — start at 0 and fade in so it eases on screen.
-            motionFade = max(motionFade, 0.2)
+            motionFade = max(motionFade, 0.15)
+            motionEMA = 0
+            stableReference = center
         }
-        lastFaceCenter = center
         lastFaceWidth = faceWidth
     }
 
@@ -197,7 +228,10 @@ class BeautyFilterProcessor {
 
         if let colorFilter = CIFilter(name: "CIColorControls") {
             colorFilter.setValue(milkyImage, forKey: kCIInputImageKey)
-            colorFilter.setValue(intensity * 0.12, forKey: kCIInputBrightnessKey)
+            // Lower brightness lift (was 0.12). The lift is what makes a misaligned mask edge look like
+            // a "white halo" — softer lift means smaller halo even if the mask is slightly off-face.
+            // The smoothing+desat still produce the milky look; brightness only adds the porcelain glow.
+            colorFilter.setValue(intensity * 0.06, forKey: kCIInputBrightnessKey)
             colorFilter.setValue(1.0 - intensity * 0.30, forKey: kCIInputSaturationKey)
             colorFilter.setValue(1.0 - intensity * 0.10, forKey: kCIInputContrastKey)
             if let result = colorFilter.outputImage?.cropped(to: workingExtent) { milkyImage = result }
@@ -219,8 +253,11 @@ class BeautyFilterProcessor {
     }
 
     private func createMilkyFaceMask(for faces: [DetectedFace], imageExtent: CGRect) -> CIImage {
-        // Use the precise Vision-landmark skin polygon when available; falls back to the elliptical
-        // bounding-box approximation only if landmarks are missing for a face.
+        // Highest-quality path: per-pixel ML skin mask from FaceParsingService.
+        // Falls back to Vision-landmark polygon, then elliptical bounding-box approximation.
+        if let mlMask = externalSkinMask, mlMask.extent.intersects(imageExtent) {
+            return mlMask
+        }
         if faces.contains(where: { $0.faceContour != nil && !($0.faceContour?.isEmpty ?? true) }) {
             return createSkinPolygonMask(for: faces, imageExtent: imageExtent)
         }
@@ -286,10 +323,13 @@ class BeautyFilterProcessor {
         }
 
         for face in faces {
-            // Fill the face contour polygon white.
+            // Fill the face contour polygon white. Vision's faceContour is an OPEN arc from one ear,
+            // along the jaw, around the chin, to the other ear — so filling it directly closes the line
+            // ear-to-ear and leaves the forehead OUT. We extend the polygon up to the top of the
+            // bounding box on both ends so it actually covers the full face including forehead.
             if let contour = face.faceContour, contour.count >= 3 {
                 ctx.setFillColor(CGColor(gray: 1, alpha: 1))
-                fillPolygon(in: ctx, points: contour.map(toMask))
+                fillPolygon(in: ctx, points: closedFacePolygon(contour: contour, boundingBox: face.boundingBox).map(toMask))
             } else {
                 // Bounding-box ellipse fallback for faces without contour landmarks. Y-down → Y-up flip.
                 let bb = face.boundingBox
@@ -333,6 +373,22 @@ class BeautyFilterProcessor {
         cachedSkinMask = mask
         cachedSkinMaskKey = key
         return mask
+    }
+
+    /// Close Vision's open jaw contour into a full face polygon by adding upper points along the top
+    /// of the face bounding box, so the polygon includes the forehead/upper face area.
+    private func closedFacePolygon(contour: [CGPoint], boundingBox: CGRect) -> [CGPoint] {
+        guard let first = contour.first, let last = contour.last else { return contour }
+        // contour is roughly: left ear → jawline → chin → right ear (Y-down, screen coords).
+        // Top of face = boundingBox.minY (Y-down). Push slightly above the box to include the
+        // forehead / hairline (~10 % of face height above the bbox top) without going into hair.
+        let foreheadY = max(0, boundingBox.minY - boundingBox.height * 0.05)
+        var poly = contour
+        // From the last contour point (one ear) up to the top of the bounding box, across to above
+        // the first contour point, then back down. Polygon is auto-closed when filled.
+        poly.append(CGPoint(x: last.x,  y: foreheadY))
+        poly.append(CGPoint(x: first.x, y: foreheadY))
+        return poly
     }
 
     private func fillPolygon(in ctx: CGContext, points: [CGPoint]) {
@@ -572,7 +628,10 @@ class BeautyFilterProcessor {
     }
 
     private func createFaceMask(for faces: [DetectedFace], imageExtent: CGRect) -> CIImage {
-        // Prefer the precise Vision-landmark polygon mask when available.
+        // Highest-quality path: per-pixel ML skin mask. Falls back to Vision-landmark polygon, then ellipse.
+        if let mlMask = externalSkinMask, mlMask.extent.intersects(imageExtent) {
+            return mlMask
+        }
         if faces.contains(where: { $0.faceContour != nil && !($0.faceContour?.isEmpty ?? true) }) {
             return createSkinPolygonMask(for: faces, imageExtent: imageExtent)
         }

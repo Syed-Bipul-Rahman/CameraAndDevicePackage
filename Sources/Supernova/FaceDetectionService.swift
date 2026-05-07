@@ -38,14 +38,15 @@ struct DetectedFace {
 class FaceDetectionService {
     private var lastDetectedFaces: [DetectedFace] = []
     private var frameCount: Int = 0
-    // Run detection every 5 frames (~6x/sec at 30fps). On A14+ this is comfortable and gives the skin
-    // mask enough updates per second to track head movement without visible lag.
-    private let detectionInterval: Int = 5
+    // Run detection every 2 frames (~15x/sec at 30fps). At Vision-downsample resolution (480 px) this is
+    // ~5-10 ms per frame on A14+, well within the 33 ms frame budget — and tight enough that the mask
+    // catches up to the face within ~65 ms, below visual perception of lag.
+    private let detectionInterval: Int = 2
     private var isDetecting: Bool = false
     private let detectionQueue = DispatchQueue(label: "com.supernova.facedetection", qos: .userInitiated)
-    // Lower than the original 0.7: less lag, mask catches up to the face within ~3 detection cycles.
-    // The motion-fade in BeautyFilterProcessor handles any residual lag by hiding the effect when moving.
-    private let smoothingFactor: CGFloat = 0.4
+    // Very light smoothing — at 15 Hz detection, a low factor keeps the mask close to the face while
+    // still removing single-frame jitter. Higher values cause visible "milky region trails the face".
+    private let smoothingFactor: CGFloat = 0.15
 
     private let ciContext: CIContext = {
         if let device = MTLCreateSystemDefaultDevice() {
