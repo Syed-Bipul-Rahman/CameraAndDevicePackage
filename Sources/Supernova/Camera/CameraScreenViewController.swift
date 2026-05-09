@@ -356,7 +356,7 @@ open class CameraScreenViewController: UIViewController {
         panel.onClose = { [weak self] in self?.hideFilterPanel() }
         panel.onSmoothChanged    = { [weak self] v in self?.filterSmooth = v }
         panel.onPlumpChanged     = { [weak self] v in self?.filterPlump = v }
-        panel.onMilkyChanged     = { [weak self] v in self?.filterMilky = v; if v > 0 { self?.filterSmooth = 0; self?.filterPlump = 0 } }
+        panel.onMilkyChanged     = { [weak self] v in self?.filterMilky = v }
         panel.onBlurChanged      = { [weak self] v in self?.filterBlur = v }
         panel.onFilterSettingsChanged = { [weak self] settings in
             self?.filterSettings = settings

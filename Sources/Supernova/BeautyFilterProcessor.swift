@@ -480,7 +480,21 @@ class BeautyFilterProcessor {
         var warped = image
         let imageExtent = image.extent
 
-        // 1) Apply bump distortion at jaw points with a much tighter radius so the warp stays inside the face.
+        // motionFade prevents the warp from appearing in the wrong place during head movement
+        // (CIBumpDistortion centers can lag behind the face by 1-2 detection cycles).
+        let intensity = Double(lipPlumpIntensity) * Double(motionFade)
+        if abs(intensity) < 0.001 { return image }
+
+        // === 1) CHEEK-APPLE bump distortion ===
+        //
+        // Despite the legacy field name `lipPlump`, this slider sculpts the CHEEKS:
+        //   slider > 0  →  positive scale  →  CIBumpDistortion expands outward  →  fuller cheeks
+        //   slider < 0  →  negative scale  →  CIBumpDistortion pinches inward   →  slimmer cheeks
+        //
+        // Bump centers are placed at the cheek-apple anatomical position:
+        //   X: 25 % / 75 % of face width  (just inboard of the cheekbone)
+        //   Y: 50 % of face height        (mid-face — between eyes and mouth)
+        // Radius covers the cheek apple area without reaching eyes or lips.
         for face in detectedFaces {
             let faceRect = CGRect(
                 x: face.boundingBox.origin.x * imageExtent.width + imageExtent.origin.x,
@@ -489,30 +503,37 @@ class BeautyFilterProcessor {
                 height: face.boundingBox.height * imageExtent.height
             )
 
-            // Slightly above the chin, pulled inward from the silhouette edge.
-            let jawY = faceRect.origin.y + faceRect.height * 0.18
-            let leftJawX  = faceRect.origin.x + faceRect.width * 0.26
-            let rightJawX = faceRect.origin.x + faceRect.width * 0.74
+            let cheekY = faceRect.origin.y + faceRect.height * 0.50
+            let leftCheekX  = faceRect.origin.x + faceRect.width * 0.25
+            let rightCheekX = faceRect.origin.x + faceRect.width * 0.75
 
-            // Radius capped at ~22% of face width — well inside the face cheek region.
+            // Radius ~22 % of face width — covers the cheek apple, doesn't reach features above (eyes)
+            // or below (mouth/jaw). Both bumps' edges meet near the nose with a tiny safety gap.
             let radius = faceRect.width * 0.22
-            let intensity = Double(lipPlumpIntensity)
-            // Symmetric, gentler distortion so realism holds at full slider extent.
-            let scale = intensity > 0 ? -intensity * 0.10 : -intensity * 0.14
+            // 0.40 magnitude at slider extremes is the sweet spot for "visibly visible" without
+            // looking cartoonish. CIBumpDistortion spec maxes at ±1.0; 0.40 is firm but realistic.
+            let scale = intensity * 0.40
 
-            for centerX in [leftJawX, rightJawX] {
+            for centerX in [leftCheekX, rightCheekX] {
                 guard let bump = CIFilter(name: "CIBumpDistortion") else { continue }
                 bump.setValue(warped, forKey: kCIInputImageKey)
-                bump.setValue(CIVector(x: centerX, y: jawY), forKey: kCIInputCenterKey)
+                bump.setValue(CIVector(x: centerX, y: cheekY), forKey: kCIInputCenterKey)
                 bump.setValue(radius, forKey: kCIInputRadiusKey)
                 bump.setValue(scale, forKey: kCIInputScaleKey)
                 if let result = bump.outputImage?.cropped(to: imageExtent) { warped = result }
             }
         }
 
-        // 2) Mask the warp to the lower face only — anything outside the mask uses the untouched original,
-        //    so background and shoulders never bend even if a stray bump radius reached them.
-        let mask = createPlumpMask(for: detectedFaces, imageExtent: imageExtent)
+        // === 2) Mask the warp to face skin only ===
+        // ML pixel-perfect mask if available, polygon/ellipse fallback otherwise. Using the ML skin
+        // mask means the bump is constrained to actual face pixels — no warp visible on hair, eyes,
+        // lips, or background.
+        let mask: CIImage
+        if let mlMask = externalSkinMask, mlMask.extent.intersects(imageExtent) {
+            mask = mlMask
+        } else {
+            mask = createPlumpMask(for: detectedFaces, imageExtent: imageExtent)
+        }
         guard let blend = CIFilter(name: "CIBlendWithMask") else { return warped }
         blend.setValue(warped, forKey: kCIInputImageKey)
         blend.setValue(image, forKey: kCIInputBackgroundImageKey)
@@ -520,9 +541,10 @@ class BeautyFilterProcessor {
         return blend.outputImage?.cropped(to: imageExtent) ?? warped
     }
 
-    /// Soft elliptical mask covering the lower 60% of each face — the jaw + lower cheeks zone.
-    /// Inset from the bounding box by ~10% so the mask stays strictly inside the face silhouette,
-    /// with a soft falloff so the transition between warped and original is invisible.
+    /// Soft elliptical mask covering the cheek-apple region of each face (middle 60 % vertically,
+    /// 90 % horizontally). Used only as a fallback — when the ML skin mask is available, plump uses
+    /// that instead. The mask must comfortably contain the bump-distortion radius around each cheek
+    /// center; a tighter mask would clip the warp at its edges and produce visible artifacts.
     private func createPlumpMask(for faces: [DetectedFace], imageExtent: CGRect) -> CIImage {
         var combined: CIImage?
         for face in faces {
@@ -533,14 +555,16 @@ class BeautyFilterProcessor {
                 height: face.boundingBox.height * imageExtent.height
             )
 
-            let insetX = faceRect.width * 0.10
-            let lowerHeight = faceRect.height * 0.60
-            // CIImage uses Y-up: faceRect.origin.y is the face bottom, so anchor the mask there.
+            // CIImage uses Y-up: faceRect.origin.y is the face bottom. Cheek band runs from ~20 % to
+            // ~80 % of face height — well around the cheek-apple bump centers at 50 %.
+            let insetX = faceRect.width * 0.05
+            let cheekBandStartY = faceRect.origin.y + faceRect.height * 0.20
+            let cheekBandHeight = faceRect.height * 0.60
             let maskRect = CGRect(
                 x: faceRect.origin.x + insetX,
-                y: faceRect.origin.y,
+                y: cheekBandStartY,
                 width: faceRect.width - insetX * 2,
-                height: lowerHeight
+                height: cheekBandHeight
             )
             let mask = createEllipticalMask(for: maskRect, imageExtent: imageExtent, softEdge: true)
             if let existing = combined {

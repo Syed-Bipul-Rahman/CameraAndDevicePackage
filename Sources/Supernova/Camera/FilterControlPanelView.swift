@@ -156,11 +156,7 @@ public final class FilterControlPanelView: UIView {
     @objc private func milkyChanged(_ slider: UISlider) {
         milky = slider.value
         milkyRow.valueLabel.text = "\(Int(milky))"
-        // Milky is exclusive — reset other filters
-        if milky > 0 {
-            smooth = 0; smoothRow.slider.value = 0; smoothRow.valueLabel.text = "0"
-            plump = 0; plumpRow.slider.value = 0; plumpRow.valueLabel.text = "0"
-        }
+        // Milky composes with the other filters; no exclusive reset.
         onMilkyChanged?(milky)
         notifySettings()
     }
