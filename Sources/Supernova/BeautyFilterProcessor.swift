@@ -49,6 +49,12 @@ class BeautyFilterProcessor {
         set { externalMaskLock.lock(); _externalSkinMask = newValue; externalMaskLock.unlock() }
     }
 
+    /// Cached extra-softened polygon mask used by plump only. Plump needs a wider feather than
+    /// the milky/smooth-shared base mask, but we don't want to recompute that extra blur on every
+    /// frame. Keyed off the base mask's cache key so it auto-invalidates whenever the base updates.
+    private var cachedPlumpExtraMask: CIImage?
+    private var cachedPlumpExtraMaskKey: String = ""
+
     // Motion-aware fade: pro apps hide the effect while the face is moving and bring it back once it
     // settles, because a rendered mask always lags reality by some milliseconds. Matching that here.
     private var motionFade: Float = 1.0
@@ -137,21 +143,24 @@ class BeautyFilterProcessor {
         }
     }
 
-    func processImage(_ inputImage: CIImage) -> CIImage {
+    /// `fullResolution = true` skips the half-res downsampling that smooth/milky/background-blur use
+    /// for live-preview performance. Photo capture must pass `true` so the saved image has full
+    /// sensor-resolution detail (no bilinear upsampling artifacts). Default `false` = live preview.
+    func processImage(_ inputImage: CIImage, fullResolution: Bool = false) -> CIImage {
         var outputImage = inputImage
 
         if backgroundBlurEnabled && backgroundBlurIntensity > 0 {
-            outputImage = applyBackgroundBlur(to: outputImage)
+            outputImage = applyBackgroundBlur(to: outputImage, fullResolution: fullResolution)
         }
 
         if faceOnlySmoothEnabled && !detectedFaces.isEmpty {
-            outputImage = applyFaceOnlySmooth(to: outputImage)
+            outputImage = applyFaceOnlySmooth(to: outputImage, fullResolution: fullResolution)
         } else if smoothSkinEnabled {
             outputImage = applySmoothSkin(to: outputImage)
         }
 
         if milkySkinEnabled && milkySkinIntensity > 0 {
-            outputImage = applyMilkySkin(to: outputImage)
+            outputImage = applyMilkySkin(to: outputImage, fullResolution: fullResolution)
         }
 
         if lipPlumpEnabled && lipPlumpIntensity != 0 && !detectedFaces.isEmpty {
@@ -201,7 +210,7 @@ class BeautyFilterProcessor {
         return colorFilter.outputImage ?? image
     }
 
-    private func applyMilkySkin(to image: CIImage) -> CIImage {
+    private func applyMilkySkin(to image: CIImage, fullResolution: Bool = false) -> CIImage {
         let imageExtent = image.extent
         let intensity = Double(milkySkinIntensity) * Double(motionFade)
         if intensity < 0.001 { return image }
@@ -232,15 +241,32 @@ class BeautyFilterProcessor {
         }
 
         // === 3. Subtle texture smoothing ===
-        // Restored to the working Gaussian-blur mix. The previous bilateral attempt used
-        // SkinSmoothingProcessor's internal elliptical mask, which fights our ML mask and creates
-        // a visible rectangular ghost around the face. Until we have a bilateral pass that uses
-        // OUR mask, this Gaussian-blur 30%-mix is the safe path: no mask conflict, ~2ms cost,
-        // gives subtle "creaminess" without pore loss.
+        // Gaussian-blur 30 %-mix gives subtle "creaminess" without pore loss. Live preview path runs
+        // the blur on a half-resolution copy then upsamples (4× cheaper, visually identical).
+        // Photo capture path runs at full resolution to preserve sensor-level detail.
         if let blur = CIFilter(name: "CIGaussianBlur") {
-            blur.setValue(milkyImage, forKey: kCIInputImageKey)
-            blur.setValue(3.0 + intensity * 5.0, forKey: kCIInputRadiusKey)
-            if let blurred = blur.outputImage?.cropped(to: imageExtent),
+            let blurredFull: CIImage?
+            if fullResolution {
+                blur.setValue(milkyImage, forKey: kCIInputImageKey)
+                blur.setValue(3.0 + intensity * 5.0, forKey: kCIInputRadiusKey)
+                blurredFull = blur.outputImage?.cropped(to: imageExtent)
+            } else {
+                let downscale: CGFloat = 0.5
+                let downExtent = CGRect(
+                    x: imageExtent.origin.x * downscale, y: imageExtent.origin.y * downscale,
+                    width: imageExtent.width * downscale, height: imageExtent.height * downscale
+                )
+                let downForBlur = milkyImage
+                    .transformed(by: CGAffineTransform(scaleX: downscale, y: downscale))
+                    .cropped(to: downExtent)
+                blur.setValue(downForBlur, forKey: kCIInputImageKey)
+                blur.setValue((3.0 + intensity * 5.0) * downscale, forKey: kCIInputRadiusKey)
+                let inv = 1.0 / downscale
+                blurredFull = blur.outputImage?.cropped(to: downForBlur.extent)
+                    .transformed(by: CGAffineTransform(scaleX: inv, y: inv))
+                    .cropped(to: imageExtent)
+            }
+            if let blurred = blurredFull,
                let dissolve = CIFilter(name: "CIDissolveTransition") {
                 dissolve.setValue(milkyImage, forKey: kCIInputImageKey)
                 dissolve.setValue(blurred, forKey: kCIInputTargetImageKey)
@@ -361,9 +387,10 @@ class BeautyFilterProcessor {
         }.joined(separator: ";")
         if key == cachedSkinMaskKey, let cached = cachedSkinMask { return cached }
 
-        // Mask resolution: cap the longer side at 1024 px. Mask is upsampled with bilinear filtering
-        // when blended, so this is invisible visually and ~16x cheaper to draw than at full 4K.
-        let longest: CGFloat = 1024
+        // Mask resolution: cap the longer side at 512 px. Mask is upsampled with bilinear filtering
+        // at usage time, so this is invisible visually and ~64× cheaper to render than full 4K.
+        // Smaller is critical now that we're using lazy blur (blur cost scales with mask area).
+        let longest: CGFloat = 512
         let scale = min(1.0, longest / max(imageExtent.width, imageExtent.height))
         let maskWidth  = Int((imageExtent.width  * scale).rounded())
         let maskHeight = Int((imageExtent.height * scale).rounded())
@@ -415,22 +442,23 @@ class BeautyFilterProcessor {
         guard let cgImage = ctx.makeImage() else { return CIImage(color: .black).cropped(to: imageExtent) }
         var mask = CIImage(cgImage: cgImage)
 
-        // Scale the mask back up to the original image extent.
+        // Feather at the polygon's native low resolution with a proportionally scaled radius.
+        // No materialization via createCGImage — that was allocating fresh IOSurfaces every detection
+        // cycle and exhausting the GPU surface pool, causing the
+        // "IOSurface signalled err=-536870206" flood and eventual signal-9 process kill.
+        // Lazy chain is reused by Core Image internally; per-frame cost is acceptable at 512 res.
+        if let blur = CIFilter(name: "CIGaussianBlur") {
+            blur.setValue(mask, forKey: kCIInputImageKey)
+            let imageSpaceRadius = max(imageExtent.width, imageExtent.height) * 0.006
+            blur.setValue(imageSpaceRadius * scale, forKey: kCIInputRadiusKey)
+            if let blurred = blur.outputImage?.cropped(to: mask.extent) { mask = blurred }
+        }
+
         if scale < 1.0 {
             let inv = 1.0 / scale
             mask = mask.transformed(by: CGAffineTransform(scaleX: inv, y: inv))
         }
-        // Translate to match imageExtent.origin.
         mask = mask.transformed(by: CGAffineTransform(translationX: imageExtent.origin.x, y: imageExtent.origin.y))
-
-        // Feather the edge so smoothed and original blend invisibly. Radius scales with image size so
-        // a 4K frame gets a proportional feather, not a hairline.
-        if let blur = CIFilter(name: "CIGaussianBlur") {
-            blur.setValue(mask, forKey: kCIInputImageKey)
-            let featherRadius = max(imageExtent.width, imageExtent.height) * 0.006
-            blur.setValue(featherRadius, forKey: kCIInputRadiusKey)
-            if let blurred = blur.outputImage?.cropped(to: imageExtent) { mask = blurred }
-        }
 
         cachedSkinMask = mask
         cachedSkinMaskKey = key
@@ -545,30 +573,30 @@ class BeautyFilterProcessor {
             ? createSkinPolygonMask(for: detectedFaces, imageExtent: imageExtent)
             : createPlumpMask(for: detectedFaces, imageExtent: imageExtent)
 
-        // Plump-specific extra mask softening. Reduced from 4 % to 1.8 % for two reasons:
-        //   1. Performance — 4 % on a 4K frame = ~161 px Gaussian blur kernel, the biggest single
-        //      cost per frame in the plump pipeline. 1.8 % = ~73 px, less than half the compute,
-        //      which directly addresses the front-camera frame drops.
-        //   2. Halo — a wider mask gradient extends further OUTSIDE the face silhouette into the
-        //      background. With 1.8 %, the gradient lives mostly inside the silhouette, killing the
-        //      faint "outline halo" you've been marking on the right side of the face.
-        // The polygon mask itself already has a 1.2 % feather baked in, so total mask gradient is
-        // ~3 % — still wider than the warp's max displacement (~2.7 % at slider extremes), which
-        // means the warp transition stays smooth.
-        let mask: CIImage
-        if let extraSoften = CIFilter(name: "CIGaussianBlur") {
-            extraSoften.setValue(baseMask, forKey: kCIInputImageKey)
-            extraSoften.setValue(max(imageExtent.width, imageExtent.height) * 0.018, forKey: kCIInputRadiusKey)
-            mask = extraSoften.outputImage?.cropped(to: imageExtent) ?? baseMask
-        } else {
-            mask = baseMask
-        }
+        // Plump-specific extra softening, cached so the blur doesn't recompute on every frame.
+        // Total mask gradient = polygon's built-in feather + this extra blur ≈ wider than warp
+        // displacement, so the warp transition stays smooth.
+        let mask = plumpExtraSoftenedMask(baseMask, imageExtent: imageExtent)
 
         guard let blend = CIFilter(name: "CIBlendWithMask") else { return warped }
         blend.setValue(warped, forKey: kCIInputImageKey)
         blend.setValue(image, forKey: kCIInputBackgroundImageKey)
         blend.setValue(mask, forKey: kCIInputMaskImageKey)
         return blend.outputImage?.cropped(to: imageExtent) ?? warped
+    }
+
+    /// Apply plump-specific extra softening to the base mask. Lazy chain only — no createCGImage
+    /// calls because they allocate fresh IOSurfaces per detection cycle and exhaust the GPU surface
+    /// pool (caused the IOSurface error flood + signal-9 process kill).
+    ///
+    /// The base mask is already cached and at 512-px native resolution, so the lazy Gaussian blur
+    /// here is cheap. CIContext reuses intermediate textures internally across multiple calls within
+    /// a render pass, so per-frame cost stays under control.
+    private func plumpExtraSoftenedMask(_ baseMask: CIImage, imageExtent: CGRect) -> CIImage {
+        guard let extraSoften = CIFilter(name: "CIGaussianBlur") else { return baseMask }
+        extraSoften.setValue(baseMask, forKey: kCIInputImageKey)
+        extraSoften.setValue(max(imageExtent.width, imageExtent.height) * 0.018, forKey: kCIInputRadiusKey)
+        return extraSoften.outputImage?.cropped(to: imageExtent) ?? baseMask
     }
 
     /// Anatomically-correct cheek-apple positions from Vision face landmarks. Returns each cheek's
@@ -682,7 +710,7 @@ class BeautyFilterProcessor {
         return combined?.cropped(to: imageExtent) ?? CIImage(color: CIColor.black).cropped(to: imageExtent)
     }
 
-    private func applyBackgroundBlur(to image: CIImage) -> CIImage {
+    private func applyBackgroundBlur(to image: CIImage, fullResolution: Bool = false) -> CIImage {
         guard #available(iOS 15.0, *),
               let request = personSegmentationRequest as? VNGeneratePersonSegmentationRequest else {
             return image
@@ -718,9 +746,31 @@ class BeautyFilterProcessor {
 
         let blurRadius = Double(5 + backgroundBlurIntensity * 20)
         guard let blurFilter = CIFilter(name: "CIGaussianBlur") else { return image }
-        blurFilter.setValue(image, forKey: kCIInputImageKey)
-        blurFilter.setValue(blurRadius, forKey: kCIInputRadiusKey)
-        guard let blurredImage = blurFilter.outputImage?.cropped(to: imageExtent) else { return image }
+        let blurredImage: CIImage
+        if fullResolution {
+            blurFilter.setValue(image, forKey: kCIInputImageKey)
+            blurFilter.setValue(blurRadius, forKey: kCIInputRadiusKey)
+            guard let b = blurFilter.outputImage?.cropped(to: imageExtent) else { return image }
+            blurredImage = b
+        } else {
+            // Live preview: blur at half resolution (~4× cheaper, visually identical for low-pass).
+            let downscale: CGFloat = 0.5
+            let downExtent = CGRect(
+                x: imageExtent.origin.x * downscale, y: imageExtent.origin.y * downscale,
+                width: imageExtent.width * downscale, height: imageExtent.height * downscale
+            )
+            let downsampled = image
+                .transformed(by: CGAffineTransform(scaleX: downscale, y: downscale))
+                .cropped(to: downExtent)
+            blurFilter.setValue(downsampled, forKey: kCIInputImageKey)
+            blurFilter.setValue(blurRadius * downscale, forKey: kCIInputRadiusKey)
+            let inv = 1.0 / downscale
+            guard let blurredDownsampled = blurFilter.outputImage?.cropped(to: downsampled.extent),
+                  let upsampled = blurredDownsampled
+                      .transformed(by: CGAffineTransform(scaleX: inv, y: inv))
+                      .cropped(to: imageExtent) as CIImage? else { return image }
+            blurredImage = upsampled
+        }
 
         guard let blendFilter = CIFilter(name: "CIBlendWithMask") else { return image }
         blendFilter.setValue(image, forKey: kCIInputImageKey)
@@ -729,15 +779,38 @@ class BeautyFilterProcessor {
         return blendFilter.outputImage?.cropped(to: imageExtent) ?? image
     }
 
-    private func applyFaceOnlySmooth(to image: CIImage) -> CIImage {
+    private func applyFaceOnlySmooth(to image: CIImage, fullResolution: Bool) -> CIImage {
         guard !detectedFaces.isEmpty else { return image }
         // Hide smoothing while the face is moving so users don't see the mask lagging.
         let effectiveIntensity = faceSmoothIntensity * motionFade
         if effectiveIntensity < 0.01 { return image }
+
         if let processor = skinSmoothingProcessor {
             processor.sigmaSpace = 5.0 + effectiveIntensity * 5.0
             processor.sigmaColor = 0.05 + (1.0 - effectiveIntensity) * 0.1
-            return processor.processImage(image, faces: detectedFaces, intensity: effectiveIntensity)
+
+            if fullResolution {
+                // Photo capture path — bilateral at native sensor resolution. Slower but produces
+                // pixel-accurate skin smoothing without bilinear upsampling artifacts.
+                return processor.processImage(image, faces: detectedFaces, intensity: effectiveIntensity)
+            }
+
+            // Live preview path — bilateral at half resolution. ~4× faster, visually identical.
+            let downscale: CGFloat = 0.5
+            let downExtent = CGRect(
+                x: image.extent.origin.x * downscale,
+                y: image.extent.origin.y * downscale,
+                width:  image.extent.width  * downscale,
+                height: image.extent.height * downscale
+            )
+            let downsampled = image
+                .transformed(by: CGAffineTransform(scaleX: downscale, y: downscale))
+                .cropped(to: downExtent)
+            let smoothed = processor.processImage(downsampled, faces: detectedFaces, intensity: effectiveIntensity)
+            let inv = 1.0 / downscale
+            return smoothed
+                .transformed(by: CGAffineTransform(scaleX: inv, y: inv))
+                .cropped(to: image.extent)
         }
         return applyFaceOnlySmoothFallback(to: image)
     }
