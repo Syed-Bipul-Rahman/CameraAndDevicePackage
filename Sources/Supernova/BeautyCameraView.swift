@@ -74,11 +74,6 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
     private let faceParsingService = FaceParsingService()
     private var lastImageSize: CGSize = .zero
 
-    /// Heavily-smoothed bounding box for the on-screen overlay. The detection-side smoothing factor is
-    /// kept light (0.15) so the *mask* tracks the face responsively, but the visible overlay rectangle
-    /// would jitter at that smoothing level — we apply a much heavier EMA here just for the visual.
-    private var displayOverlayBBox: CGRect?
-
     private var photoOutput: AVCapturePhotoOutput?
     private var photoCaptureCompletion: ((Result<String, Error>) -> Void)?
 
@@ -910,30 +905,16 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
                         let ox = (1.0 - sx) / 2.0
                         let oy = (1.0 - sy) / 2.0
 
-                        // Heavy smoothing for the visible overlay box only. Mask path uses the
-                        // unsmoothed-by-this-EMA bbox internally, so the mask still tracks the face.
-                        let visualSmoothing: CGFloat = 0.78
-                        let facesData = faces.map { face -> [String: Double] in
-                            let bbox: CGRect
-                            if let prev = self.displayOverlayBBox {
-                                bbox = CGRect(
-                                    x: prev.origin.x * visualSmoothing + face.boundingBox.origin.x * (1 - visualSmoothing),
-                                    y: prev.origin.y * visualSmoothing + face.boundingBox.origin.y * (1 - visualSmoothing),
-                                    width:  prev.width  * visualSmoothing + face.boundingBox.width  * (1 - visualSmoothing),
-                                    height: prev.height * visualSmoothing + face.boundingBox.height * (1 - visualSmoothing)
-                                )
-                            } else {
-                                bbox = face.boundingBox
-                            }
-                            self.displayOverlayBBox = bbox
-                            return [
-                                "x": Double(bbox.origin.x * sx + ox),
-                                "y": Double(bbox.origin.y * sy + oy),
-                                "width":  Double(bbox.width  * sx),
-                                "height": Double(bbox.height * sy),
-                            ]
-                        }
-                        if faces.isEmpty { self.displayOverlayBBox = nil }
+                        // Send raw detected bboxes to the delegate. Visual smoothing is handled by
+                        // FaceTrackingOverlayView's per-frame CADisplayLink interpolation — that gives
+                        // 60 Hz glide between the 15 Hz detection updates. Doing it here too would just
+                        // stack two EMAs and add lag without smoothing further.
+                        let facesData = faces.map { face -> [String: Double] in [
+                            "x": Double(face.boundingBox.origin.x * sx + ox),
+                            "y": Double(face.boundingBox.origin.y * sy + oy),
+                            "width":  Double(face.boundingBox.width  * sx),
+                            "height": Double(face.boundingBox.height * sy),
+                        ]}
                         self.delegate?.beautyCameraView(self, didDetectFaces: facesData)
                     }
                 }

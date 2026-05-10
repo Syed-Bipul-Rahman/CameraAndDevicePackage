@@ -503,42 +503,145 @@ class BeautyFilterProcessor {
                 height: face.boundingBox.height * imageExtent.height
             )
 
-            let cheekY = faceRect.origin.y + faceRect.height * 0.50
-            let leftCheekX  = faceRect.origin.x + faceRect.width * 0.25
-            let rightCheekX = faceRect.origin.x + faceRect.width * 0.75
+            // Landmark-based cheek positioning. This is invariant to how the face bounding box is
+            // padded — front and back cameras can produce different amounts of hair / forehead in
+            // the bbox depending on detection, so bbox-relative positions land slightly off on one
+            // camera vs the other. Eye + mouth landmarks give the same anatomical cheek apple
+            // position consistently across cameras and head poses.
+            let centers: [(CGPoint, CGFloat)] = cheekCenters(for: face, imageExtent: imageExtent)
+                ?? bboxFallbackCenters(faceRect: faceRect)
 
-            // Radius ~22 % of face width — covers the cheek apple, doesn't reach features above (eyes)
-            // or below (mouth/jaw). Both bumps' edges meet near the nose with a tiny safety gap.
-            let radius = faceRect.width * 0.22
-            // 0.40 magnitude at slider extremes is the sweet spot for "visibly visible" without
-            // looking cartoonish. CIBumpDistortion spec maxes at ±1.0; 0.40 is firm but realistic.
-            let scale = intensity * 0.40
+            // Scale bumped to 0.55 (was 0.45) to keep visible strength similar after the radius
+            // shrinkage above. Smaller, more concentrated bumps that don't reach the nose or silhouette
+            // — slim and plump now sculpt the cheek apple cleanly without distorting other features.
+            let scale = intensity * 0.55
 
-            for centerX in [leftCheekX, rightCheekX] {
+            for (center, radius) in centers {
                 guard let bump = CIFilter(name: "CIBumpDistortion") else { continue }
                 bump.setValue(warped, forKey: kCIInputImageKey)
-                bump.setValue(CIVector(x: centerX, y: cheekY), forKey: kCIInputCenterKey)
+                bump.setValue(CIVector(x: center.x, y: center.y), forKey: kCIInputCenterKey)
                 bump.setValue(radius, forKey: kCIInputRadiusKey)
                 bump.setValue(scale, forKey: kCIInputScaleKey)
                 if let result = bump.outputImage?.cropped(to: imageExtent) { warped = result }
             }
         }
 
-        // === 2) Mask the warp to face skin only ===
-        // ML pixel-perfect mask if available, polygon/ellipse fallback otherwise. Using the ML skin
-        // mask means the bump is constrained to actual face pixels — no warp visible on hair, eyes,
-        // lips, or background.
-        let mask: CIImage
-        if let mlMask = externalSkinMask, mlMask.extent.intersects(imageExtent) {
-            mask = mlMask
-        } else {
-            mask = createPlumpMask(for: detectedFaces, imageExtent: imageExtent)
+        // === 2) Mask the warp to face skin — temporally synced ===
+        //
+        // Plump deliberately does NOT use the ML mask (externalSkinMask). The ML mask is more
+        // spatially precise (per-pixel skin segmentation) but lags 1–2 detection cycles because
+        // it comes from FaceParsingService running asynchronously. For color filters like milky,
+        // that lag is invisible — but for warping filters like plump, the mask edge has to track
+        // the face frame-by-frame, otherwise displaced pixels show up beyond the face silhouette
+        // (the "small overlay out of place" artifact, especially during head turns).
+        //
+        // The face-contour polygon mask is built from the SAME detection pass that produced the
+        // bump centers, so the warp and the mask are always at the same face position.
+        let hasContour = detectedFaces.contains { face in
+            if let c = face.faceContour { return !c.isEmpty }
+            return false
         }
+        let baseMask: CIImage = hasContour
+            ? createSkinPolygonMask(for: detectedFaces, imageExtent: imageExtent)
+            : createPlumpMask(for: detectedFaces, imageExtent: imageExtent)
+
+        // Plump-specific extra mask softening. Reduced from 4 % to 1.8 % for two reasons:
+        //   1. Performance — 4 % on a 4K frame = ~161 px Gaussian blur kernel, the biggest single
+        //      cost per frame in the plump pipeline. 1.8 % = ~73 px, less than half the compute,
+        //      which directly addresses the front-camera frame drops.
+        //   2. Halo — a wider mask gradient extends further OUTSIDE the face silhouette into the
+        //      background. With 1.8 %, the gradient lives mostly inside the silhouette, killing the
+        //      faint "outline halo" you've been marking on the right side of the face.
+        // The polygon mask itself already has a 1.2 % feather baked in, so total mask gradient is
+        // ~3 % — still wider than the warp's max displacement (~2.7 % at slider extremes), which
+        // means the warp transition stays smooth.
+        let mask: CIImage
+        if let extraSoften = CIFilter(name: "CIGaussianBlur") {
+            extraSoften.setValue(baseMask, forKey: kCIInputImageKey)
+            extraSoften.setValue(max(imageExtent.width, imageExtent.height) * 0.018, forKey: kCIInputRadiusKey)
+            mask = extraSoften.outputImage?.cropped(to: imageExtent) ?? baseMask
+        } else {
+            mask = baseMask
+        }
+
         guard let blend = CIFilter(name: "CIBlendWithMask") else { return warped }
         blend.setValue(warped, forKey: kCIInputImageKey)
         blend.setValue(image, forKey: kCIInputBackgroundImageKey)
         blend.setValue(mask, forKey: kCIInputMaskImageKey)
         return blend.outputImage?.cropped(to: imageExtent) ?? warped
+    }
+
+    /// Anatomically-correct cheek-apple positions from Vision face landmarks. Returns each cheek's
+    /// (center, radius) in CIImage Y-up coordinates. Returns nil if any required landmark is missing.
+    ///
+    /// Cheek X is horizontally aligned with the eye center; Y is midway between eye and mouth — the
+    /// classic "where the cheek bone is most visible" anatomical landmark. Radius is derived from
+    /// inter-eye distance (not bbox width), so it's invariant to how much hair / forehead the face
+    /// bounding box happens to include — which is what was producing the front-camera-only artifact
+    /// we saw with the previous bbox-relative positioning.
+    private func cheekCenters(for face: DetectedFace, imageExtent: CGRect) -> [(CGPoint, CGFloat)]? {
+        guard let leftEye = centroid(of: face.leftEye),
+              let rightEye = centroid(of: face.rightEye),
+              let mouth = centroid(of: face.outerLips) else { return nil }
+
+        // Inter-eye distance in normalized space. Used both as a scale reference for the radius and
+        // for the outboard offset that places cheek centers laterally outside the eye axis (where
+        // the cheekbone actually is anatomically).
+        let dxN = rightEye.x - leftEye.x
+        let eyeDistanceN = abs(dxN)
+        let direction: CGFloat = dxN >= 0 ? 1 : -1
+        // 15% outboard offset — places cheek center on the cheekbone line (lateral to eye), not
+        // directly under the pupil. This also pushes the two bumps apart so they don't overlap at
+        // the nose, which was producing the "stretched nose" artifact at strong slim values.
+        let outboardN = eyeDistanceN * 0.15
+
+        let leftCheekN  = CGPoint(x: leftEye.x  - direction * outboardN,
+                                  y: (leftEye.y  + mouth.y) / 2)
+        let rightCheekN = CGPoint(x: rightEye.x + direction * outboardN,
+                                  y: (rightEye.y + mouth.y) / 2)
+
+        // Convert to CI Y-up image coordinates.
+        func toCIPoint(_ p: CGPoint) -> CGPoint {
+            CGPoint(x: p.x * imageExtent.width + imageExtent.origin.x,
+                    y: (1.0 - p.y) * imageExtent.height + imageExtent.origin.y)
+        }
+        let leftCheek = toCIPoint(leftCheekN)
+        let rightCheek = toCIPoint(rightCheekN)
+
+        // Radius in image pixels. Reduced from 0.50 → 0.28 of inter-eye distance so:
+        //   • bumps don't overlap at the nose (gap between bumps now ~0.70 × eye-distance, well
+        //     wider than typical nose width)
+        //   • bumps don't reach the face silhouette (gap to silhouette ~0.30 × eye-distance)
+        let dyN = rightEye.y - leftEye.y
+        let dxImg = dxN * imageExtent.width
+        let dyImg = dyN * imageExtent.height
+        let eyeDistance = sqrt(dxImg * dxImg + dyImg * dyImg)
+
+        // Radius: 0.32 × eye-distance is wide enough for a clearly visible cheek effect, narrow
+        // enough that the bumps don't overlap at the nose (gap remains ~0.66 × eye-distance). On
+        // very-close-up front-camera shots the eye distance can be huge, which makes the bump
+        // expensive to compute — cap at 200 px so frame rate stays solid even at extreme close-ups.
+        let baseRadius = eyeDistance * 0.32
+        let radius = min(baseRadius, 200.0)
+        return [(leftCheek, radius), (rightCheek, radius)]
+    }
+
+    /// Fallback cheek positions when landmarks aren't available: 30 / 70 % of bbox width, mid-height.
+    private func bboxFallbackCenters(faceRect: CGRect) -> [(CGPoint, CGFloat)] {
+        let cheekY = faceRect.origin.y + faceRect.height * 0.50
+        let leftCheekX  = faceRect.origin.x + faceRect.width * 0.30
+        let rightCheekX = faceRect.origin.x + faceRect.width * 0.70
+        let radius = faceRect.width * 0.16
+        return [(CGPoint(x: leftCheekX, y: cheekY), radius),
+                (CGPoint(x: rightCheekX, y: cheekY), radius)]
+    }
+
+    private func centroid(of points: [CGPoint]?) -> CGPoint? {
+        guard let pts = points, !pts.isEmpty else { return nil }
+        let n = CGFloat(pts.count)
+        let sx = pts.reduce(0) { $0 + $1.x }
+        let sy = pts.reduce(0) { $0 + $1.y }
+        return CGPoint(x: sx / n, y: sy / n)
     }
 
     /// Soft elliptical mask covering the cheek-apple region of each face (middle 60 % vertically,
