@@ -992,9 +992,7 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
         DispatchQueue.main.async { completion(.success(fileURL.path)) }
 
         let saveToLibrary = {
-            PHPhotoLibrary.shared().performChanges {
-                PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: fileURL)
-            } completionHandler: { _, _ in }
+            SupernovaAlbum.addAsset(from: fileURL, isVideo: false) { _, _ in }
         }
 
         if #available(iOS 14, *) {
@@ -1182,9 +1180,7 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
 
     private func saveVideoToLibrary(videoURL: URL, completion: @escaping (Result<String, Error>) -> Void) {
         let saveVideo = {
-            PHPhotoLibrary.shared().performChanges {
-                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: videoURL)
-            } completionHandler: { success, error in
+            SupernovaAlbum.addAsset(from: videoURL, isVideo: true) { success, error in
                 DispatchQueue.main.async {
                     if success {
                         completion(.success(videoURL.path))

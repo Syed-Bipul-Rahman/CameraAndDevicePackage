@@ -80,8 +80,32 @@ public final class PhotoGalleryViewController: UIViewController {
         options.predicate = NSPredicate(format: "mediaType = %d OR mediaType = %d",
                                         PHAssetMediaType.image.rawValue,
                                         PHAssetMediaType.video.rawValue)
-        assets = PHAsset.fetchAssets(with: options)
+
+        // Only show captures made by this app. They live in our dedicated album; if it doesn't
+        // exist yet (nothing captured) the gallery is simply empty rather than showing the
+        // whole camera roll.
+        if let album = SupernovaAlbum.existingCollection() {
+            assets = PHAsset.fetchAssets(in: album, options: options)
+        } else {
+            assets = PHFetchResult()
+        }
         collectionView.reloadData()
+
+        if assets.count == 0 { showEmptyState() }
+    }
+
+    private func showEmptyState() {
+        let label = UILabel()
+        label.text = "No photos yet.\nPhotos you capture will appear here."
+        label.textColor = .white; label.textAlignment = .center; label.numberOfLines = 0
+        label.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            label.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 32),
+            label.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -32),
+        ])
     }
 
     private func showPermissionDenied() {
