@@ -818,7 +818,14 @@ class BeautyFilterProcessor {
         // Input is already at the working resolution (downsampled by processImage for live preview,
         // or full sensor for photo capture). No per-filter downsampling needed.
         if let processor = skinSmoothingProcessor {
-            processor.sigmaSpace = 5.0 + effectiveIntensity * 5.0
+            // The Metal bilateral cost is (2·int(sigmaSpace)+1)² samples PER PIXEL, every frame.
+            // Letting sigmaSpace ride the slider to ~10 tripled per-frame cost vs the low end —
+            // that's the "frame drop when I raise beautify" the user hit. Cap the spatial radius
+            // for the LIVE path only; the photo path (fullResolution) keeps the full radius so
+            // captured quality is unchanged. Strength at high intensity is carried by the bigger
+            // colour tolerance instead, which costs nothing extra.
+            let rawSigma = 5.0 + effectiveIntensity * 5.0
+            processor.sigmaSpace = fullResolution ? rawSigma : min(rawSigma, 6.0)
             processor.sigmaColor = 0.05 + (1.0 - effectiveIntensity) * 0.1
             return processor.processImage(image, faces: detectedFaces, intensity: effectiveIntensity)
         }

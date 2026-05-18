@@ -53,6 +53,10 @@ open class CameraScreenViewController: UIViewController {
     private var switchOverlay: UIView!
     private var timerOverlay: TimerCountdownView?
     private var recordingBadge: RecordingBadgeView?
+    private var filterPresetStrip: FilterPresetStripView?
+    private var intensitySlider: VerticalIntensitySlider?
+    private var selectedFilterPreset: LiveFilterPreset = .original
+    private var beautyIntensity: Float = 0.65
 
     // MARK: - Lifecycle
 
@@ -319,6 +323,7 @@ open class CameraScreenViewController: UIViewController {
             hideFilterPanel()
         } else {
             hideLightPanel(animated: false)
+            hideFilterPresetStrip()
             showFilterPanel()
         }
     }
@@ -377,6 +382,87 @@ open class CameraScreenViewController: UIViewController {
             panel.animateOut { panel.removeFromSuperview() }
         } else {
             panel.removeFromSuperview()
+        }
+    }
+
+    private func showFilterPresetStrip() {
+        if filterPresetStrip != nil { return }
+
+        let strip = FilterPresetStripView(presets: LiveFilterPreset.allCases, selected: selectedFilterPreset)
+        strip.onSelectionChanged = { [weak self] preset in
+            guard let self = self else { return }
+            self.selectedFilterPreset = preset
+            self.applyFilterPreset(preset)
+        }
+        strip.translatesAutoresizingMaskIntoConstraints = false
+        strip.alpha = 0
+        strip.transform = CGAffineTransform(translationX: 0, y: 18)
+        view.addSubview(strip)
+        NSLayoutConstraint.activate([
+            strip.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            strip.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            strip.bottomAnchor.constraint(equalTo: bottomControls.topAnchor, constant: -12),
+            strip.heightAnchor.constraint(equalToConstant: 74),
+        ])
+        filterPresetStrip = strip
+        UIView.animate(withDuration: 0.22, delay: 0, options: [.curveEaseOut]) {
+            strip.alpha = 1
+            strip.transform = .identity
+        }
+    }
+
+    private func hideFilterPresetStrip() {
+        hideIntensitySlider()
+        guard let strip = filterPresetStrip else { return }
+        filterPresetStrip = nil
+        UIView.animate(withDuration: 0.18, delay: 0, options: [.curveEaseIn]) {
+            strip.alpha = 0
+            strip.transform = CGAffineTransform(translationX: 0, y: 18)
+        } completion: { _ in
+            strip.removeFromSuperview()
+        }
+    }
+
+    private func applyFilterPreset(_ preset: LiveFilterPreset) {
+        filterSettings = preset.settings(intensity: beautyIntensity)
+        cameraView.setFilter(filterSettings)
+        if preset.isAdjustable {
+            showIntensitySlider()
+        } else {
+            hideIntensitySlider()
+        }
+    }
+
+    private func showIntensitySlider() {
+        if intensitySlider != nil { return }
+        let slider = VerticalIntensitySlider()
+        slider.setValue(beautyIntensity, notify: false)
+        slider.onChange = { [weak self] v in
+            guard let self = self else { return }
+            self.beautyIntensity = v
+            self.filterSettings = self.selectedFilterPreset.settings(intensity: v)
+            self.cameraView.setFilter(self.filterSettings)
+        }
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        slider.alpha = 0
+        view.addSubview(slider)
+        NSLayoutConstraint.activate([
+            slider.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -10),
+            slider.widthAnchor.constraint(equalToConstant: 48),
+            slider.centerYAnchor.constraint(equalTo: view.centerYAnchor, constant: -30),
+            slider.heightAnchor.constraint(equalToConstant: 300),
+        ])
+        intensitySlider = slider
+        UIView.animate(withDuration: 0.2) { slider.alpha = 1 }
+    }
+
+    private func hideIntensitySlider() {
+        guard let slider = intensitySlider else { return }
+        intensitySlider = nil
+        UIView.animate(withDuration: 0.16) {
+            slider.alpha = 0
+        } completion: { _ in
+            slider.removeFromSuperview()
         }
     }
 
@@ -523,6 +609,15 @@ extension CameraScreenViewController: CameraAppBarViewDelegate {
 
     public func cameraAppBar(_ bar: CameraAppBarView, didToggleFilter enabled: Bool) {
         filterEnabled = enabled
+        if enabled {
+            hideFilterPanel(animated: false)
+            showFilterPresetStrip()
+            applyFilterPreset(selectedFilterPreset)
+        } else {
+            hideFilterPresetStrip()
+            filterSettings = FilterSettings()
+            cameraView.setFilter(filterSettings)
+        }
     }
 
     public func cameraAppBarDidTapBack(_ bar: CameraAppBarView) {
@@ -546,6 +641,326 @@ extension CameraScreenViewController: BottomControlsViewDelegate {
         guard !isRecording else { return }
         isVideoMode = isVideo
         bottomControls.setVideoMode(isVideo)
+    }
+}
+
+// MARK: - Live filter presets
+
+private enum LiveFilterPreset: CaseIterable {
+    case original
+    case kiss
+    case retouch
+    case beauty
+
+    var displayName: String {
+        switch self {
+        case .original: return "Original"
+        case .kiss:     return "Kiss"
+        case .retouch:  return "Retouch"
+        case .beauty:   return "Beauty"
+        }
+    }
+
+    /// `beauty` is the only preset that responds to the intensity slider. The others have no
+    /// effect yet, so the slider stays hidden for them.
+    var isAdjustable: Bool { self == .beauty }
+
+    var avatarColors: [UIColor] {
+        switch self {
+        case .original:
+            return [UIColor(red: 0.82, green: 0.82, blue: 0.85, alpha: 1), UIColor(red: 0.32, green: 0.32, blue: 0.36, alpha: 1)]
+        case .kiss:
+            return [UIColor(red: 1.0, green: 0.52, blue: 0.62, alpha: 1), UIColor(red: 0.34, green: 0.13, blue: 0.18, alpha: 1)]
+        case .retouch:
+            return [UIColor(red: 0.96, green: 0.67, blue: 0.53, alpha: 1), UIColor(red: 0.18, green: 0.13, blue: 0.11, alpha: 1)]
+        case .beauty:
+            return [UIColor(red: 0.93, green: 0.86, blue: 1.0, alpha: 1), UIColor(red: 0.45, green: 0.68, blue: 1.0, alpha: 1)]
+        }
+    }
+
+    /// `intensity` is the slider value (0…1). Only `beauty` uses it; everything scales from a
+    /// strong floor at slider 0 up to a Gradient-matching maximum at slider 1.
+    func settings(intensity: Float) -> FilterSettings {
+        var settings = FilterSettings()
+
+        switch self {
+        case .original, .kiss, .retouch:
+            // No-op for now. `original` is the unprocessed baseline; `kiss`/`retouch` are
+            // placeholders that fall through to the same neutral settings.
+            break
+        case .beauty:
+            // Matched to Gradient's "BEAUTY" (from_gradient.jpeg + the recording): strongly
+            // smoothed, even, luminous skin while beard/brows/eyes/contour stay sharp. The
+            // previous fixed 0.60 was far too weak vs Gradient — smoothing now ramps from a
+            // strong 0.55 floor to an aggressive 0.97 at max, with the glow / brightening /
+            // even-tone scaling alongside it so the whole look intensifies together.
+            let t = max(0, min(1, intensity))
+            settings.faceOnlySmooth = true
+            settings.faceSmoothIntensity = 0.55 + t * 0.42       // 0.55 → 0.97
+            settings.milkySkin = true
+            settings.milkySkinIntensity = 0.14 + t * 0.20        // 0.14 → 0.34 (luminous glow)
+            settings.warmTone = true
+            settings.warmthIntensity = 0.08 + t * 0.14           // subtle warm cast
+            settings.brightness = 0.03 + t * 0.09                // lifts skin / under-eye shadow
+            settings.saturation = 1.03 + t * 0.07
+            settings.contrast = 1.4
+        }
+
+        return settings
+    }
+}
+
+private final class FilterPresetStripView: UIView {
+
+    var onSelectionChanged: ((LiveFilterPreset) -> Void)?
+
+    private let scrollView = UIScrollView()
+    private let stackView = UIStackView()
+    private var cells: [LiveFilterPresetCell] = []
+    private var selected: LiveFilterPreset
+
+    init(presets: [LiveFilterPreset], selected: LiveFilterPreset) {
+        self.selected = selected
+        super.init(frame: .zero)
+        setup(presets: presets)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func setup(presets: [LiveFilterPreset]) {
+        backgroundColor = UIColor.black.withAlphaComponent(0.28)
+
+        scrollView.showsHorizontalScrollIndicator = false
+        scrollView.alwaysBounceHorizontal = true
+        scrollView.contentInset = UIEdgeInsets(top: 0, left: 18, bottom: 0, right: 18)
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(scrollView)
+
+        stackView.axis = .horizontal
+        stackView.spacing = 20
+        stackView.alignment = .center
+        stackView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.addSubview(stackView)
+
+        NSLayoutConstraint.activate([
+            scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            stackView.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
+            stackView.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
+            stackView.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
+            stackView.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
+            stackView.heightAnchor.constraint(equalTo: scrollView.frameLayoutGuide.heightAnchor),
+        ])
+
+        for preset in presets {
+            let cell = LiveFilterPresetCell(preset: preset)
+            cell.isSelected = preset == selected
+            cell.addTarget(self, action: #selector(cellTapped(_:)), for: .touchUpInside)
+            cells.append(cell)
+            stackView.addArrangedSubview(cell)
+        }
+    }
+
+    @objc private func cellTapped(_ sender: LiveFilterPresetCell) {
+        selected = sender.preset
+        for cell in cells {
+            cell.isSelected = cell.preset == selected
+        }
+        onSelectionChanged?(selected)
+    }
+}
+
+private final class LiveFilterPresetCell: UIControl {
+
+    let preset: LiveFilterPreset
+
+    private let avatarView = GradientAvatarView()
+    private let nameLabel = UILabel()
+
+    override var isSelected: Bool {
+        didSet { updateSelection() }
+    }
+
+    init(preset: LiveFilterPreset) {
+        self.preset = preset
+        super.init(frame: .zero)
+        setup()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func setup() {
+        widthAnchor.constraint(equalToConstant: 64).isActive = true
+        heightAnchor.constraint(equalToConstant: 54).isActive = true
+
+        avatarView.colors = preset.avatarColors
+        avatarView.translatesAutoresizingMaskIntoConstraints = false
+        avatarView.isUserInteractionEnabled = false
+        addSubview(avatarView)
+
+        nameLabel.text = preset.displayName
+        nameLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        nameLabel.textAlignment = .center
+        nameLabel.translatesAutoresizingMaskIntoConstraints = false
+        nameLabel.isUserInteractionEnabled = false
+        addSubview(nameLabel)
+
+        NSLayoutConstraint.activate([
+            avatarView.centerXAnchor.constraint(equalTo: centerXAnchor),
+            avatarView.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            avatarView.widthAnchor.constraint(equalToConstant: 24),
+            avatarView.heightAnchor.constraint(equalToConstant: 24),
+            nameLabel.topAnchor.constraint(equalTo: avatarView.bottomAnchor, constant: 7),
+            nameLabel.leadingAnchor.constraint(equalTo: leadingAnchor),
+            nameLabel.trailingAnchor.constraint(equalTo: trailingAnchor),
+        ])
+
+        updateSelection()
+    }
+
+    private func updateSelection() {
+        avatarView.layer.borderWidth = isSelected ? 2 : 0
+        avatarView.layer.borderColor = UIColor.white.cgColor
+        avatarView.outerRingColor = isSelected ? UIColor(red: 0.47, green: 0.33, blue: 1.0, alpha: 1) : .clear
+        nameLabel.textColor = isSelected ? .white : UIColor.white.withAlphaComponent(0.55)
+        nameLabel.font = .systemFont(ofSize: 11, weight: isSelected ? .bold : .semibold)
+    }
+}
+
+private final class GradientAvatarView: UIView {
+
+    var colors: [UIColor] = [.darkGray, .black] {
+        didSet { gradientLayer.colors = colors.map(\.cgColor) }
+    }
+
+    var outerRingColor: UIColor = .clear {
+        didSet { ringLayer.borderColor = outerRingColor.cgColor }
+    }
+
+    private let gradientLayer = CAGradientLayer()
+    private let ringLayer = CALayer()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        layer.insertSublayer(ringLayer, at: 0)
+        layer.insertSublayer(gradientLayer, at: 1)
+        clipsToBounds = false
+        gradientLayer.colors = colors.map(\.cgColor)
+        gradientLayer.startPoint = CGPoint(x: 0.2, y: 0)
+        gradientLayer.endPoint = CGPoint(x: 0.85, y: 1)
+        ringLayer.borderWidth = 2
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let radius = min(bounds.width, bounds.height) / 2
+        ringLayer.frame = bounds.insetBy(dx: -3, dy: -3)
+        ringLayer.cornerRadius = radius + 3
+        gradientLayer.frame = bounds
+        gradientLayer.cornerRadius = radius
+        layer.cornerRadius = radius
+    }
+}
+
+// MARK: - Vertical intensity slider
+
+/// Matches Gradient's right-edge intensity control: a tall translucent rounded track, a small
+/// horizontal centre tick marking the neutral point, and a large solid-white draggable thumb.
+/// Top of the track = 1.0 (max), bottom = 0.0.
+private final class VerticalIntensitySlider: UIView {
+
+    var onChange: ((Float) -> Void)?
+
+    private(set) var value: Float = 0.65 {
+        didSet { setNeedsLayout() }
+    }
+
+    func setValue(_ v: Float, notify: Bool) {
+        value = max(0, min(1, v))
+        if notify { onChange?(value) }
+    }
+
+    private let track = UIView()
+    private let centreTick = UIView()
+    private let thumb = UIView()
+
+    private let trackWidth: CGFloat = 6
+    private let thumbSize: CGFloat = 46
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = true
+
+        track.backgroundColor = UIColor.white.withAlphaComponent(0.30)
+        track.layer.cornerRadius = trackWidth / 2
+        track.isUserInteractionEnabled = false
+        addSubview(track)
+
+        centreTick.backgroundColor = UIColor.white.withAlphaComponent(0.7)
+        centreTick.layer.cornerRadius = 1
+        centreTick.isUserInteractionEnabled = false
+        addSubview(centreTick)
+
+        thumb.backgroundColor = .white
+        thumb.layer.cornerRadius = thumbSize / 2
+        thumb.layer.shadowColor = UIColor.black.cgColor
+        thumb.layer.shadowOpacity = 0.28
+        thumb.layer.shadowRadius = 5
+        thumb.layer.shadowOffset = CGSize(width: 0, height: 2)
+        thumb.isUserInteractionEnabled = false
+        addSubview(thumb)
+
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+        addGestureRecognizer(pan)
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+        addGestureRecognizer(tap)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// Vertical centres the thumb can travel between (inset by half a thumb so it never clips).
+    private var travelRange: (top: CGFloat, bottom: CGFloat) {
+        (thumbSize / 2, bounds.height - thumbSize / 2)
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let cx = bounds.midX
+        let (top, bottom) = travelRange
+
+        track.frame = CGRect(x: cx - trackWidth / 2, y: top,
+                              width: trackWidth, height: bottom - top)
+        centreTick.frame = CGRect(x: cx - 9, y: bounds.midY - 1, width: 18, height: 2)
+
+        let y = bottom - CGFloat(value) * (bottom - top)
+        thumb.frame = CGRect(x: cx - thumbSize / 2, y: y - thumbSize / 2,
+                             width: thumbSize, height: thumbSize)
+    }
+
+    private func value(atY y: CGFloat) -> Float {
+        let (top, bottom) = travelRange
+        guard bottom > top else { return value }
+        let clamped = min(max(y, top), bottom)
+        return Float((bottom - clamped) / (bottom - top))
+    }
+
+    @objc private func handlePan(_ gr: UIPanGestureRecognizer) {
+        let y = gr.location(in: self).y
+        setValue(value(atY: y), notify: true)
+    }
+
+    @objc private func handleTap(_ gr: UITapGestureRecognizer) {
+        let y = gr.location(in: self).y
+        setValue(value(atY: y), notify: true)
+    }
+
+    // Generous touch target — the visible thumb/track is thin but the whole strip is draggable.
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        bounds.insetBy(dx: -24, dy: 0).contains(point)
     }
 }
 
@@ -788,4 +1203,3 @@ private final class RecordingBadgeView: UIView {
 private extension CGFloat {
     func clamped(_ lo: CGFloat, _ hi: CGFloat) -> CGFloat { Swift.max(lo, Swift.min(self, hi)) }
 }
-
