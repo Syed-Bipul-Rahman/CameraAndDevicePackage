@@ -753,18 +753,14 @@ class BeautyFilterProcessor {
                             || abs(imageExtent.height - cachedMaskSourceSize.height) > 100
 
         if segmentationFrameCounter % 8 == 0 || cachedPersonMask == nil || imageSizeChanged {
-            // Render the input at half resolution for VN segmentation. The person mask comes back at
-            // VN's own model resolution regardless of input size, then we scale it to imageExtent
-            // anyway — so a 4K input is wasted. Half-res input cuts createCGImage cost ~4× and is
-            // visually identical after the soft mask blur.
+            // Feed VN the CIImage directly. The previous version called context.createCGImage(...)
+            // here, which allocated a fresh IOSurface every 8 frames — over time those accumulated
+            // and the system started signalling IOSurface exhaustion (err=-536870206), eventually
+            // freezing the app. VN renders internally with its own pool, so this avoids leaking
+            // surfaces into our shared CIContext.
             let segScale: CGFloat = 0.5
-            let segExtent = CGRect(
-                x: imageExtent.origin.x * segScale, y: imageExtent.origin.y * segScale,
-                width:  imageExtent.width  * segScale, height: imageExtent.height * segScale
-            )
             let segInput = image.transformed(by: CGAffineTransform(scaleX: segScale, y: segScale))
-            guard let cgImage = context.createCGImage(segInput, from: segExtent) else { return image }
-            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            let handler = VNImageRequestHandler(ciImage: segInput, options: [:])
             do {
                 try handler.perform([request])
                 if let result = request.results?.first {
