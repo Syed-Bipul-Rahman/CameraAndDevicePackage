@@ -364,7 +364,6 @@ final class CircleToggleButton: UIControl {
             iconView.widthAnchor.constraint(equalToConstant: 18),
             iconView.heightAnchor.constraint(equalToConstant: 18),
         ])
-        addTarget(self, action: #selector(tapped), for: .touchUpInside)
         updateAppearance()
     }
 
@@ -373,7 +372,9 @@ final class CircleToggleButton: UIControl {
         iconView.tintColor = isOn ? UIColor(red: 0.2, green: 0.2, blue: 0.2, alpha: 1) : .white
     }
 
-    @objc private func tapped() {
+    override func endTracking(_ touch: UITouch?, with event: UIEvent?) {
+        super.endTracking(touch, with: event)
+        guard let point = touch?.location(in: self), bounds.contains(point) else { return }
         sendActions(for: .touchUpInside)
     }
 }
