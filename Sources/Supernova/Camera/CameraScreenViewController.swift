@@ -402,7 +402,7 @@ open class CameraScreenViewController: UIViewController {
             strip.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             strip.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             strip.bottomAnchor.constraint(equalTo: bottomControls.topAnchor, constant: -12),
-            strip.heightAnchor.constraint(equalToConstant: 74),
+            strip.heightAnchor.constraint(equalToConstant: 150),
         ])
         filterPresetStrip = strip
         UIView.animate(withDuration: 0.22, delay: 0, options: [.curveEaseOut]) {
@@ -665,17 +665,22 @@ private enum LiveFilterPreset: CaseIterable {
     /// effect yet, so the slider stays hidden for them.
     var isAdjustable: Bool { self == .beauty }
 
-    var avatarColors: [UIColor] {
+    /// Circular preset icon. `kiss` / `retouch` / `beauty` use the bundled illustrations;
+    /// `original` has no artwork so it falls back to a neutral SF Symbol.
+    var iconImage: UIImage? {
+        let resourceName: String?
         switch self {
-        case .original:
-            return [UIColor(red: 0.82, green: 0.82, blue: 0.85, alpha: 1), UIColor(red: 0.32, green: 0.32, blue: 0.36, alpha: 1)]
-        case .kiss:
-            return [UIColor(red: 1.0, green: 0.52, blue: 0.62, alpha: 1), UIColor(red: 0.34, green: 0.13, blue: 0.18, alpha: 1)]
-        case .retouch:
-            return [UIColor(red: 0.96, green: 0.67, blue: 0.53, alpha: 1), UIColor(red: 0.18, green: 0.13, blue: 0.11, alpha: 1)]
-        case .beauty:
-            return [UIColor(red: 0.93, green: 0.86, blue: 1.0, alpha: 1), UIColor(red: 0.45, green: 0.68, blue: 1.0, alpha: 1)]
+        case .original: resourceName = nil
+        case .kiss:     resourceName = "kissfilterIcon"
+        case .retouch:  resourceName = "retouchfilterIcon"
+        case .beauty:   resourceName = "beautyfilterIcon"
         }
+        if let name = resourceName,
+           let img = UIImage(named: name, in: .module, compatibleWith: nil) {
+            return img
+        }
+        // `original` (or a missing asset): neutral face glyph.
+        return UIImage(systemName: "person.crop.circle")
     }
 
     /// `intensity` is the slider value (0…1). Only `beauty` uses it; everything scales from a
@@ -776,7 +781,9 @@ private final class LiveFilterPresetCell: UIControl {
 
     let preset: LiveFilterPreset
 
-    private let avatarView = GradientAvatarView()
+    private static let iconSize: CGFloat = 100
+
+    private let iconView = UIImageView()
     private let nameLabel = UILabel()
 
     override var isSelected: Bool {
@@ -792,27 +799,32 @@ private final class LiveFilterPresetCell: UIControl {
     required init?(coder: NSCoder) { fatalError() }
 
     private func setup() {
-        widthAnchor.constraint(equalToConstant: 64).isActive = true
-        heightAnchor.constraint(equalToConstant: 54).isActive = true
+        let size = Self.iconSize
+        widthAnchor.constraint(equalToConstant: size + 12).isActive = true
+        heightAnchor.constraint(equalToConstant: size + 30).isActive = true
 
-        avatarView.colors = preset.avatarColors
-        avatarView.translatesAutoresizingMaskIntoConstraints = false
-        avatarView.isUserInteractionEnabled = false
-        addSubview(avatarView)
+        iconView.image = preset.iconImage
+        iconView.contentMode = .scaleAspectFill
+        iconView.clipsToBounds = true
+        iconView.layer.cornerRadius = size / 2
+        iconView.tintColor = .white
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.isUserInteractionEnabled = false
+        addSubview(iconView)
 
         nameLabel.text = preset.displayName
-        nameLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        nameLabel.font = .systemFont(ofSize: 12, weight: .semibold)
         nameLabel.textAlignment = .center
         nameLabel.translatesAutoresizingMaskIntoConstraints = false
         nameLabel.isUserInteractionEnabled = false
         addSubview(nameLabel)
 
         NSLayoutConstraint.activate([
-            avatarView.centerXAnchor.constraint(equalTo: centerXAnchor),
-            avatarView.topAnchor.constraint(equalTo: topAnchor, constant: 4),
-            avatarView.widthAnchor.constraint(equalToConstant: 24),
-            avatarView.heightAnchor.constraint(equalToConstant: 24),
-            nameLabel.topAnchor.constraint(equalTo: avatarView.bottomAnchor, constant: 7),
+            iconView.centerXAnchor.constraint(equalTo: centerXAnchor),
+            iconView.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            iconView.widthAnchor.constraint(equalToConstant: size),
+            iconView.heightAnchor.constraint(equalToConstant: size),
+            nameLabel.topAnchor.constraint(equalTo: iconView.bottomAnchor, constant: 7),
             nameLabel.leadingAnchor.constraint(equalTo: leadingAnchor),
             nameLabel.trailingAnchor.constraint(equalTo: trailingAnchor),
         ])
@@ -821,48 +833,12 @@ private final class LiveFilterPresetCell: UIControl {
     }
 
     private func updateSelection() {
-        avatarView.layer.borderWidth = isSelected ? 2 : 0
-        avatarView.layer.borderColor = UIColor.white.cgColor
-        avatarView.outerRingColor = isSelected ? UIColor(red: 0.47, green: 0.33, blue: 1.0, alpha: 1) : .clear
+        iconView.layer.borderWidth = isSelected ? 3 : 0
+        iconView.layer.borderColor = UIColor(red: 0.47, green: 0.33, blue: 1.0, alpha: 1).cgColor
+        iconView.alpha = isSelected ? 1.0 : 0.78
         nameLabel.textColor = isSelected ? .white : UIColor.white.withAlphaComponent(0.55)
-        nameLabel.font = .systemFont(ofSize: 11, weight: isSelected ? .bold : .semibold)
-    }
-}
-
-private final class GradientAvatarView: UIView {
-
-    var colors: [UIColor] = [.darkGray, .black] {
-        didSet { gradientLayer.colors = colors.map(\.cgColor) }
-    }
-
-    var outerRingColor: UIColor = .clear {
-        didSet { ringLayer.borderColor = outerRingColor.cgColor }
-    }
-
-    private let gradientLayer = CAGradientLayer()
-    private let ringLayer = CALayer()
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        layer.insertSublayer(ringLayer, at: 0)
-        layer.insertSublayer(gradientLayer, at: 1)
-        clipsToBounds = false
-        gradientLayer.colors = colors.map(\.cgColor)
-        gradientLayer.startPoint = CGPoint(x: 0.2, y: 0)
-        gradientLayer.endPoint = CGPoint(x: 0.85, y: 1)
-        ringLayer.borderWidth = 2
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        let radius = min(bounds.width, bounds.height) / 2
-        ringLayer.frame = bounds.insetBy(dx: -3, dy: -3)
-        ringLayer.cornerRadius = radius + 3
-        gradientLayer.frame = bounds
-        gradientLayer.cornerRadius = radius
-        layer.cornerRadius = radius
+        nameLabel.font = .systemFont(ofSize: 12, weight: isSelected ? .bold : .semibold)
+        transform = isSelected ? CGAffineTransform(scaleX: 1.05, y: 1.05) : .identity
     }
 }
 

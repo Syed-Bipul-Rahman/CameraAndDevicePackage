@@ -20,7 +20,10 @@ let package = Package(
                 .copy("Resources/FaceParsing.mlmodelc"),
                 .process("Resources/tut1.jpg"),
                 .process("Resources/tut2.jpg"),
-                .process("Resources/tut3.jpg")
+                .process("Resources/tut3.jpg"),
+                .process("Resources/beautyfilterIcon.png"),
+                .process("Resources/kissfilterIcon.png"),
+                .process("Resources/retouchfilterIcon.png")
             ]
         )
     ]
