@@ -1303,7 +1303,15 @@ public class BeautyCameraView: UIView, AVCaptureVideoDataOutputSampleBufferDeleg
         let fetchOptions = PHFetchOptions()
         fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
         fetchOptions.fetchLimit = 1
-        let fetchResult = PHAsset.fetchAssets(with: .image, options: fetchOptions)
+        fetchOptions.predicate = NSPredicate(format: "mediaType = %d", PHAssetMediaType.image.rawValue)
+
+        // Scope the camera-page thumbnail to this app's album too, so it matches the gallery
+        // instead of showing the newest photo from the whole camera roll.
+        guard let album = SupernovaAlbum.existingCollection() else {
+            DispatchQueue.main.async { completion(nil) }
+            return
+        }
+        let fetchResult = PHAsset.fetchAssets(in: album, options: fetchOptions)
 
         guard let latestAsset = fetchResult.firstObject else {
             DispatchQueue.main.async { completion(nil) }
